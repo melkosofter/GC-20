@@ -1,1966 +1,1440 @@
-/*  SBM-20 based Geiger Counter
-    Author: Prabhat    Email: pra22@pitt.edu
-    Sketch for ESP8266 that counts clicks from the Geiger tube, calculates the counts per minute, and displays information 
-    on a TFT touchscreen.
-    Attribution-ShareAlike 4.0 International (CC BY-SA 4.0)
+/*  GC-20 Geiger Counter v3.2
+    SBM-20 radiation monitor — 2.8" TFT touchscreen (TPM408 / ILI9341 + XPT2046)
+    Standalone instrument. No WiFi, no cloud.
+    Uses built-in font at larger sizes — reliable on all ESP8266 boards.
+
+    Original: Prabhat (pra22@pitt.edu) — CC BY-SA 4.0
 */
+
+// ============================================================================
+// INCLUDES
+// ============================================================================
 #include <Arduino.h>
-#include <ESP8266WiFi.h>
-#include <EthernetClient.h>
-#include <DNSServer.h>
-#include <ESP8266WebServer.h>
-#include <WifiManager.h>
 #include <EEPROM.h>
-#include "SPI.h"
-#include "Adafruit_GFX.h"
-#include <Fonts/FreeSans9pt7b.h>
-#include <Fonts/FreeSans12pt7b.h>
-#include "Adafruit_ILI9341.h"
+#include <SPI.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_ILI9341.h>
 #include <XPT2046_Touchscreen.h>
 
-#define CS_PIN D2
-XPT2046_Touchscreen ts(CS_PIN);
+// ============================================================================
+// PIN DEFINITIONS — TPM408-2.8
+// ============================================================================
+#define TFT_CS      D8
+#define TFT_DC      D4
+#define TOUCH_CS    D2
+#define BUZZER_PIN  D0
+#define LED_PIN     D3
+#define BATTERY_PIN A0
+#define INT_PIN     5
 
-#define TS_MINX 250
-#define TS_MINY 200 // calibration points for touchscreen
-#define TS_MAXX 3800
-#define TS_MAXY 3750
+// TPM408-2.8 touch calibration
+#define TS_MINX  320
+#define TS_MINY  470
+#define TS_MAXX  3800
+#define TS_MAXY  3826
 
-#define TFT_DC D4
-#define TFT_CS D8
+// ============================================================================
+// COLORS (RGB565)
+// ============================================================================
+#define C_BLACK       0x0000
+#define C_WHITE       0xFFFF
+#define C_RED         0xF800
+#define C_GREEN       0x07E0
+#define C_YELLOW      0xFFE0
+#define C_CYAN        0x07FF
+#define C_BLUE        0x001F
 
-#define BLACK 0x0000
-#define BLUE 0x001F
-#define RED 0xF800
-#define GREEN 0x07E0
-#define CYAN 0x07FF
-#define MAGENTA 0xF81F
-#define YELLOW 0xFFE0
-#define WHITE 0xFFFF
-#define DOSEBACKGROUND 0x0455
+#define C_BG          0x0000
+#define C_CARD_BG     0x0841
+#define C_HEADER_BG   0x18C3
+#define C_ACCENT      0x2A86
+#define C_ACCENT2     0x3B8F
+#define C_DIM         0x94B2
 
-// WiFi variables
-unsigned long currentUploadTime;
-unsigned long previousUploadTime;
-int passwordLength;
-int SSIDLength;
-int channelIDLength;
-int writeAPILength;
-char ssid[20];
-char password[20];
-char channelID[20]; // = "864288";
-char channelAPIkey[20]; // = "37SAHQPEQ7FOBC20";
-char server[] = "api.thingspeak.com";
-int attempts; // number of connection attempts when device starts up in monitoring mode
-WiFiClient client;
+#define C_CARD_OK     0x0455
+#define C_CARD_WARN   0x6240
+#define C_CARD_DANGER 0x6000
 
-Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+#define C_BTN_BG      0x18C3
+#define C_BTN_ON      0x0442
+#define C_BTN_OFF     0x4208
+#define C_BTN_DIM     0x1082
 
-const int interruptPin = 5;
+// ============================================================================
+// SMALL BITMAPS (PROGMEM)
+// ============================================================================
 
-long count[61];
-long fastCount[6]; // arrays to store running counts
-long slowCount[181];
-int i = 0;         // array elements
-int j = 0;
-int k = 0;
-
-int page = 0;
-
-long currentMillis;
-long previousMillis;
-unsigned long currentMicros;
-unsigned long previousMicros;
-
-unsigned long averageCount;
-unsigned long currentCount;  // incremented by interrupt
-unsigned long previousCount; // to activate buzzer and LED
-unsigned long cumulativeCount;
-float doseRate;
-float totalDose;
-char dose[5];
-int doseLevel;               // determines home screen warning signs
-int previousDoseLevel;
-
-bool ledSwitch = 1;
-bool buzzerSwitch = 1;
-bool wasTouched;
-int integrationMode = 0; // 0 = medium, 1 = fast, 2 == slow;
-
-bool doseUnits = 0; // 0 = Sievert, 1 = Rem
-unsigned int alarmThreshold = 5;
-unsigned int conversionFactor = 175;
-
-int x, y; // touch points
-
-// Battery indicator variables
-int batteryInput;
-int batteryPercent;
-int batteryMapped = 212;       // pixel location of battery icon
-int batteryUpdateCounter = 29;
-
-// EEPROM variables
-const int saveUnits = 0;
-const int saveAlertThreshold = 1; // Addresses for storing settings data in the EEPROM
-const int saveCalibration = 2;
-const int saveDeviceMode = 3;
-const int saveLoggingMode = 4;
-const int saveSSIDLen = 5;
-const int savePWLen = 6;
-const int saveIDLen = 7;
-const int saveAPILen = 8;
-
-// Data Logging variables
-int addr = 200;                 // starting address for data logging
-char jsonBuffer[14000] = "["; 
-char data[14500] = "{\"write_api_key\":\"";
-unsigned long currentLogTime;
-unsigned long previousLogTime;
-
-
-// Timed Count Variables:
-int interval = 5;
-unsigned long intervalMillis;
-unsigned long startMillis;
-unsigned long elapsedTime;
-int progress;
-float cpm;
-bool completed = 0;
-int intervalSize; // stores how many digits are in the interval
-
-// Logging variables
-bool isLogging;
-
-bool deviceMode;
-
-// interrupt routine declaration
-void ICACHE_RAM_ATTR isr();
-
-unsigned int previousIntMicros;              // timers to limit count increment rate in the ISR
-
-const unsigned char gammaBitmap [] PROGMEM = {
+// Gamma — 18x18 (3 bytes/row = 54 bytes)
+const unsigned char gammaIcon[] PROGMEM = {
 	0x30, 0x00, 0x78, 0x70, 0xe8, 0xe0, 0xc4, 0xe0, 0x84, 0xc0, 0x05, 0xc0, 0x05, 0x80, 0x07, 0x80, 
 	0x03, 0x00, 0x07, 0x00, 0x0e, 0x00, 0x0e, 0x00, 0x1e, 0x00, 0x1e, 0x00, 0x1e, 0x00, 0x3e, 0x00, 
-	0x1c, 0x00, 0x00, 0x00
-};
+	0x1c, 0x00, 0x00, 0x00};
 
-const unsigned char betaBitmap [] PROGMEM = {
-	0x00, 0xc0, 0x00, 0x03, 0xf0, 0x00, 0x07, 0x18, 0x00, 0x06, 0x18, 0x00, 0x0e, 0x18, 0x00, 0x0e, 
-	0x18, 0x00, 0x0e, 0xf8, 0x00, 0x0e, 0x1c, 0x00, 0x0e, 0x0c, 0x00, 0x0e, 0x0c, 0x00, 0x0e, 0x0c, 
-	0x00, 0x0e, 0x0c, 0x00, 0x0f, 0x1c, 0x00, 0x0f, 0xf8, 0x00, 0x0e, 0x00, 0x00, 0x0e, 0x00, 0x00, 
-	0x0c, 0x00, 0x00, 0x00, 0x00, 0x00
-};
-const unsigned char wifiBitmap [] PROGMEM = {
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xf0, 0x00, 0x0f, 0xfe, 0x00, 0x3f, 0xff, 0x80, 0x78, 
-	0x03, 0xc0, 0xe0, 0x00, 0xe0, 0x47, 0xfc, 0x40, 0x0f, 0xfe, 0x00, 0x1c, 0x07, 0x00, 0x08, 0x02, 
-	0x00, 0x01, 0xf0, 0x00, 0x03, 0xf8, 0x00, 0x01, 0x10, 0x00, 0x00, 0x40, 0x00, 0x00, 0xe0, 0x00, 
-	0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
+// Beta — 18x18 (3 bytes/row)
+const unsigned char betaIcon[] PROGMEM = {
+    0x00,0xc0,0x00,0x03,0xf0,0x00,0x07,0x18,0x00,0x06,0x18,0x00,
+    0x0e,0x18,0x00,0x0e,0x18,0x00,0x0e,0xf8,0x00,0x0e,0x1c,0x00,
+    0x0e,0x0c,0x00,0x0e,0x0c,0x00,0x0e,0x0c,0x00,0x0e,0x0c,0x00,
+    0x0f,0x1c,0x00,0x0f,0xf8,0x00,0x0e,0x00,0x00,0x0e,0x00,0x00,
+    0x0c,0x00,0x00,0x00,0x00,0x00 };
 
-const unsigned char settingsBitmap[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x80, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe0, 0x00, 0x00, 0x00,
-    0x00, 0x01, 0xc0, 0x7f, 0xe0, 0x38, 0x00, 0x00, 0x00, 0x03, 0xf0, 0x7f, 0xe0, 0xfc, 0x00, 0x00,
-    0x00, 0x07, 0xf9, 0xff, 0xf9, 0xfe, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
-    0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
-    0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00,
-    0x00, 0x03, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00,
-    0x00, 0x01, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x03, 0xff, 0xf0, 0x7f, 0xfc, 0x00, 0x00,
-    0x00, 0x03, 0xff, 0xc0, 0x3f, 0xfc, 0x00, 0x00, 0x00, 0x1f, 0xff, 0x80, 0x1f, 0xff, 0x80, 0x00,
-    0x00, 0xff, 0xff, 0x00, 0x0f, 0xff, 0xf0, 0x00, 0x01, 0xff, 0xff, 0x00, 0x07, 0xff, 0xf8, 0x00,
-    0x01, 0xff, 0xfe, 0x00, 0x07, 0xff, 0xf8, 0x00, 0x01, 0xff, 0xfe, 0x00, 0x07, 0xff, 0xf8, 0x00,
-    0x01, 0xff, 0xfe, 0x00, 0x07, 0xff, 0xf8, 0x00, 0x01, 0xff, 0xfe, 0x00, 0x07, 0xff, 0xf8, 0x00,
-    0x01, 0xff, 0xfe, 0x00, 0x07, 0xff, 0xf8, 0x00, 0x00, 0xff, 0xff, 0x00, 0x0f, 0xff, 0xf0, 0x00,
-    0x00, 0x1f, 0xff, 0x80, 0x1f, 0xff, 0x80, 0x00, 0x00, 0x03, 0xff, 0xc0, 0x3f, 0xfc, 0x00, 0x00,
-    0x00, 0x03, 0xff, 0xe0, 0x7f, 0xfc, 0x00, 0x00, 0x00, 0x01, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00,
-    0x00, 0x01, 0xff, 0xff, 0xff, 0xf8, 0x00, 0x00, 0x00, 0x03, 0xff, 0xff, 0xff, 0xfc, 0x00, 0x00,
-    0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00, 0x00, 0x07, 0xff, 0xff, 0xff, 0xfe, 0x00, 0x00,
-    0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
-    0x00, 0x0f, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0x00, 0x07, 0xf9, 0xff, 0xf9, 0xfe, 0x00, 0x00,
-    0x00, 0x03, 0xf0, 0x7f, 0xe0, 0xfc, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x7f, 0xe0, 0x38, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x7f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xc0, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// Speaker ON — 24x16
+const unsigned char speakerOn[] PROGMEM = {
+    0x01,0xc0,0x00,0x02,0x40,0x00,0x04,0x42,0x00,0x08,0x41,0x00,
+    0xf0,0x50,0x80,0x80,0x48,0x80,0x80,0x44,0x40,0x80,0x44,0x40,
+    0x80,0x44,0x40,0x80,0x48,0x80,0xf0,0x50,0x80,0x08,0x41,0x00,
+    0x04,0x42,0x00,0x02,0x40,0x00,0x01,0xc0,0x00,0x00,0x00,0x00 };
 
-const unsigned char buzzerOnBitmap[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x80, 0x0c, 0x00,
-    0x00, 0x00, 0x07, 0x80, 0x0e, 0x00, 0x00, 0x00, 0x0f, 0x80, 0x0f, 0x00, 0x00, 0x00, 0x1f, 0x80,
-    0x07, 0x00, 0x00, 0x00, 0x3f, 0x80, 0xc7, 0x80, 0x00, 0x00, 0xff, 0x80, 0xe3, 0x80, 0x00, 0x01,
-    0xff, 0x80, 0xf3, 0xc0, 0x00, 0x03, 0xff, 0x80, 0x71, 0xc0, 0x00, 0x07, 0xff, 0x8c, 0x79, 0xc0,
-    0x3f, 0xff, 0xff, 0x9e, 0x38, 0xe0, 0x3f, 0xff, 0xff, 0x8e, 0x38, 0xe0, 0x3f, 0xff, 0xff, 0x8e,
-    0x3c, 0xe0, 0x3f, 0xff, 0xff, 0x87, 0x1c, 0xe0, 0x3f, 0xff, 0xff, 0x87, 0x1c, 0x60, 0x3f, 0xff,
-    0xff, 0x87, 0x1c, 0x70, 0x3f, 0xff, 0xff, 0x87, 0x1c, 0x70, 0x3f, 0xff, 0xff, 0x87, 0x1c, 0x70,
-    0x3f, 0xff, 0xff, 0x87, 0x1c, 0x70, 0x3f, 0xff, 0xff, 0x87, 0x1c, 0x70, 0x3f, 0xff, 0xff, 0x87,
-    0x1c, 0xe0, 0x3f, 0xff, 0xff, 0x8e, 0x3c, 0xe0, 0x3f, 0xff, 0xff, 0x8e, 0x38, 0xe0, 0x3f, 0xff,
-    0xff, 0x9e, 0x38, 0xe0, 0x00, 0x07, 0xff, 0x8c, 0x79, 0xc0, 0x00, 0x03, 0xff, 0x80, 0x71, 0xc0,
-    0x00, 0x00, 0xff, 0x80, 0xf1, 0xc0, 0x00, 0x00, 0x7f, 0x80, 0xe3, 0x80, 0x00, 0x00, 0x3f, 0x80,
-    0xc7, 0x80, 0x00, 0x00, 0x1f, 0x80, 0x07, 0x00, 0x00, 0x00, 0x0f, 0x80, 0x0f, 0x00, 0x00, 0x00,
-    0x07, 0x80, 0x0e, 0x00, 0x00, 0x00, 0x03, 0x80, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// Speaker OFF — 24x16
+const unsigned char speakerOff[] PROGMEM = {
+    0x80,0xe0,0x00,0x41,0x20,0x00,0x22,0x20,0x00,0x14,0x20,0x00,
+    0x78,0x20,0x00,0x44,0x20,0x00,0x42,0x20,0x00,0x41,0x20,0x00,
+    0x40,0xa0,0x00,0x40,0x60,0x00,0x78,0x20,0x00,0x04,0x30,0x00,
+    0x02,0x28,0x00,0x01,0x24,0x00,0x00,0xe2,0x00,0x00,0x00,0x00 };
 
-const unsigned char buzzerOffBitmap[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x80,
-    0x00, 0x00, 0x00, 0x00, 0x0f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00,
-    0x3f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00, 0xff, 0x80, 0x00, 0x00,
-    0x00, 0x03, 0xff, 0x80, 0x00, 0x00, 0x00, 0x07, 0xff, 0x80, 0x00, 0x00, 0x00, 0x0f, 0xff, 0x80,
-    0x00, 0x00, 0x0f, 0xff, 0xff, 0x80, 0x00, 0x00, 0x1f, 0xff, 0xff, 0x80, 0x00, 0x00, 0x3f, 0xff,
-    0xff, 0x8f, 0x00, 0x78, 0x7f, 0xff, 0xff, 0x8f, 0x80, 0xf8, 0x7f, 0xff, 0xff, 0x8f, 0xc1, 0xf8,
-    0x7f, 0xff, 0xff, 0x87, 0xe3, 0xf0, 0x7f, 0xff, 0xff, 0x83, 0xf7, 0xe0, 0x7f, 0xff, 0xff, 0x81,
-    0xff, 0xc0, 0x7f, 0xff, 0xff, 0x80, 0xff, 0x80, 0x7f, 0xff, 0xff, 0x80, 0x7f, 0x00, 0x7f, 0xff,
-    0xff, 0x80, 0x7f, 0x00, 0x7f, 0xff, 0xff, 0x80, 0xff, 0x80, 0x7f, 0xff, 0xff, 0x81, 0xff, 0xc0,
-    0x7f, 0xff, 0xff, 0x83, 0xf7, 0xe0, 0x7f, 0xff, 0xff, 0x87, 0xe3, 0xf0, 0x7f, 0xff, 0xff, 0x8f,
-    0xc1, 0xf0, 0x7f, 0xff, 0xff, 0x8f, 0x80, 0xf8, 0x3f, 0xff, 0xff, 0x8f, 0x00, 0x70, 0x3f, 0xff,
-    0xff, 0x84, 0x00, 0x20, 0x1f, 0xff, 0xff, 0x80, 0x00, 0x00, 0x0f, 0xff, 0xff, 0x80, 0x00, 0x00,
-    0x00, 0x07, 0xff, 0x80, 0x00, 0x00, 0x00, 0x03, 0xff, 0x80, 0x00, 0x00, 0x00, 0x01, 0xff, 0x80,
-    0x00, 0x00, 0x00, 0x00, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 0x7f, 0x80, 0x00, 0x00, 0x00, 0x00,
-    0x1f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x0f, 0x80, 0x00, 0x00, 0x00, 0x00, 0x07, 0x80, 0x00, 0x00,
-    0x00, 0x00, 0x03, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+// Menu gear — 16x16
+const unsigned char menuIcon[] PROGMEM = {
+    0x03,0xc0,0x12,0x48,0x2c,0x34,0x40,0x02,0x23,0xc4,0x24,0x24,
+    0xc8,0x13,0x88,0x11,0x88,0x11,0xc8,0x13,0x24,0x24,0x23,0xc4,
+    0x40,0x02,0x2c,0x34,0x12,0x48,0x03,0xc0 };
 
-const unsigned char ledOnBitmap[] PROGMEM = {
-    0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00,
-    0x00, 0x00, 0x00, 0x18, 0x07, 0x00, 0xc0, 0x00, 0x00, 0x1c, 0x07, 0x01, 0xc0, 0x00, 0x00, 0x1e,
-    0x07, 0x03, 0xc0, 0x00, 0x00, 0x0e, 0x07, 0x03, 0x80, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x80, 0x00,
-    0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x1e, 0x00, 0x1f, 0xc0, 0x03, 0xc0, 0x0f, 0x80, 0x7f, 0xf0, 0x0f, 0x80, 0x07, 0xc1,
-    0xff, 0xfc, 0x1f, 0x00, 0x03, 0xc3, 0xe0, 0x3e, 0x1e, 0x00, 0x00, 0x07, 0xc0, 0x0f, 0x00, 0x00,
-    0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x80, 0x00, 0x00, 0x0e, 0x00, 0x03,
-    0x80, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0, 0x00, 0x7f, 0x1c,
-    0x00, 0x01, 0xc3, 0xf0, 0x7f, 0x1c, 0x00, 0x01, 0xc7, 0xf0, 0x3c, 0x0e, 0x00, 0x03, 0x81, 0xe0,
-    0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x0f, 0x00, 0x07,
-    0x80, 0x00, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x80, 0x0f, 0x00, 0x00, 0x01, 0xc3,
-    0xc0, 0x1e, 0x1c, 0x00, 0x07, 0xc1, 0xc0, 0x1c, 0x1f, 0x00, 0x0f, 0x81, 0xe0, 0x3c, 0x0f, 0x80,
-    0x1e, 0x00, 0xe0, 0x38, 0x03, 0xc0, 0x0c, 0x00, 0xe0, 0x38, 0x01, 0x80, 0x00, 0x00, 0xf0, 0x78,
-    0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00,
-    0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00,
-    0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0,
-    0x00, 0x00, 0x00, 0x00, 0x1f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00};
+// Timed clock — 16x16
+const unsigned char timedIcon[] PROGMEM = {
+    0x07,0xc0,0x18,0x30,0x29,0x28,0x41,0x04,0x61,0x0c,0x81,0x02,
+    0x81,0x02,0xe1,0x0e,0x80,0x82,0x80,0x42,0x60,0x2c,0x40,0x04,
+    0x29,0x28,0x19,0x30,0x07,0xc0,0x00,0x00 };
 
-const unsigned char ledOffBitmap[] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x00, 0x00, 0x1f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x01,
-    0xff, 0xfc, 0x00, 0x00, 0x00, 0x03, 0xe0, 0x3e, 0x00, 0x00, 0x00, 0x07, 0xc0, 0x0f, 0x00, 0x00,
-    0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x0f, 0x00, 0x07, 0x80, 0x00, 0x00, 0x0e, 0x00, 0x03,
-    0x80, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0, 0x00, 0x00, 0x1c,
-    0x00, 0x01, 0xc0, 0x00, 0x00, 0x1c, 0x00, 0x01, 0xc0, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x80, 0x00,
-    0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x0e, 0x00, 0x03, 0x80, 0x00, 0x00, 0x0f, 0x00, 0x07,
-    0x80, 0x00, 0x00, 0x07, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x80, 0x0f, 0x00, 0x00, 0x00, 0x03,
-    0xc0, 0x1e, 0x00, 0x00, 0x00, 0x01, 0xc0, 0x1c, 0x00, 0x00, 0x00, 0x01, 0xe0, 0x3c, 0x00, 0x00,
-    0x00, 0x00, 0xe0, 0x38, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x38, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x78,
-    0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00,
-    0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00,
-    0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x3f, 0xe0,
-    0x00, 0x00, 0x00, 0x00, 0x1f, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00};
+// LED ON — 16x16
+const unsigned char ledOnIcon[] PROGMEM = {
+    0x20,0x04,0x13,0xc8,0x04,0x20,0x08,0x10,0xa9,0x15,0x09,0x90,
+    0x09,0x10,0x24,0x24,0x42,0x42,0x01,0x00,0x03,0xc0,0x00,0x00,
+    0x03,0xc0,0x00,0x00,0x01,0x80,0x00,0x00 };
 
-const unsigned char backBitmap [] PROGMEM = {
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xc0, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x1f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe0, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x03, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x1f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 
-    0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xc0, 
-    0x07, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x80, 0x01, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xf0, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x1f, 0xf8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xfe, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x07, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0xff, 0x80, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7f, 0xe0, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x1f, 0xe0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0f, 0xc0, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-};
+// LED OFF — 16x7
+const unsigned char ledOffIcon[] PROGMEM = {
+    0x3c,0x42,0x81,0x81,0x81,0x81,0x42,0x24,0x10,0x3c,0x00,0x3c,
+    0x00,0x18 };
 
-void drawHomePage();              // page 0
-void drawSettingsPage();          // page 1
-void drawUnitsPage();             // page 2
-void drawAlertPage();             // page 3
-void drawCalibrationPage();       // page 4
-void drawWifiPage();              // page 5
-void drawTimedCountPage();        // page 6
-void drawTimedCountRunningPage(int duration, int size); // page 7 
-void drawDeviceModePage();        // page 8
+// Back arrow — 16x7
+const unsigned char backArrow[] PROGMEM = {
+    0x03,0x00,0x00,0x03,0x00,0x00,0x0f,0x00,0x00,0x0f,0x00,0x00,0x3f,0xff,0xc0,0x3f,0xff,0xc0,0xff,0xff,0xc0,0xff,0xff,0xc0,0x3f,0xff,0xc0,0x3f,0xff,0xc0,0x0f,0x00,0x00,0x0f,0x00,0x00,0x03,0x00,0x00,0x03,0x00,0x00 };
 
-void drawFrame();
+// Splash screen logo -- 65x61
+const unsigned char splashLogo[] PROGMEM = {0x00,0x06,0x00,0x00,0x00,0x00,0x30,0x00,0x00,0x00,0x0f,0x00,0x00,0x00,0x00,0x78,0x00,0x00,0x00,0x1f,0x80,0x00,0x00,0x00,0xfc,0x00,0x00,0x00,0x7f,0xc0,0x00,0x00,0x01,0xfe,0x00,0x00,0x00,0xff,0xc0,0x00,0x00,0x01,0xff,0x00,0x00,0x00,0xff,0xe0,0x00,0x00,0x03,0xff,0x80,0x00,0x01,0xff,0xe0,0x00,0x00,0x07,0xff,0xc0,0x00,0x03,0xff,0xf0,0x00,0x00,0x07,0xff,0xe0,0x00,0x07,0xff,0xf8,0x00,0x00,0x0f,0xff,0xf0,0x00,0x07,0xff,0xf8,0x00,0x00,0x1f,0xff,0xf0,0x00,0x0f,0xff,0xfc,0x00,0x00,0x1f,0xff,0xf8,0x00,0x1f,0xff,0xfe,0x00,0x00,0x3f,0xff,0xfc,0x00,0x1f,0xff,0xfe,0x00,0x00,0x3f,0xff,0xfc,0x00,0x3f,0xff,0xff,0x00,0x00,0x7f,0xff,0xfe,0x00,0x3f,0xff,0xff,0x80,0x00,0xff,0xff,0xfe,0x00,0x7f,0xff,0xff,0x80,0x00,0xff,0xff,0xfe,0x00,0x7f,0xff,0xff,0xc0,0x01,0xff,0xff,0xff,0x00,0x7f,0xff,0xff,0xe0,0x03,0xff,0xff,0xff,0x00,0x7f,0xff,0xff,0xe0,0x03,0xff,0xff,0xff,0x00,0xff,0xff,0xff,0xc0,0x01,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x80,0x00,0xff,0xff,0xff,0x80,0xff,0xff,0xff,0x03,0xe0,0x7f,0xff,0xff,0x80,0xff,0xff,0xfe,0x0f,0xf8,0x3f,0xff,0xff,0x80,0xff,0xff,0xfe,0x1f,0xfc,0x3f,0xff,0xff,0x80,0xff,0xff,0xfc,0x1f,0xfc,0x1f,0xff,0xff,0x80,0xff,0xff,0xfc,0x3f,0xfe,0x1f,0xff,0xff,0x80,0xff,0xff,0xfc,0x3f,0xfe,0x1f,0xff,0xff,0x80,0x7f,0xff,0xfc,0x3f,0xfe,0x1f,0xff,0xff,0x00,0x00,0x00,0x00,0x3f,0xfe,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3f,0xfe,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x1f,0xfc,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x1f,0xfc,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x0f,0xf8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x03,0xe0,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x3c,0x1e,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7f,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x7f,0xff,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0x00,0x01,0xff,0xff,0xc0,0x00,0x00,0x00,0x00,0x00,0x03,0xff,0xff,0xe0,0x00,0x00,0x00,0x00,0x00,0x03,0xff,0xff,0xe0,0x00,0x00,0x00,0x00,0x00,0x07,0xff,0xff,0xf0,0x00,0x00,0x00,0x00,0x00,0x0f,0xff,0xff,0xf8,0x00,0x00,0x00,0x00,0x00,0x0f,0xff,0xff,0xf8,0x00,0x00,0x00,0x00,0x00,0x1f,0xff,0xff,0xfc,0x00,0x00,0x00,0x00,0x00,0x3f,0xff,0xff,0xfc,0x00,0x00,0x00,0x00,0x00,0x3f,0xff,0xff,0xfe,0x00,0x00,0x00,0x00,0x00,0x7f,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x7f,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0x7f,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0x00,0x3f,0xff,0xff,0xfe,0x00,0x00,0x00,0x00,0x00,0x07,0xff,0xff,0xf0,0x00,0x00,0x00,0x00,0x00,0x00,0xff,0xff,0x80,0x00,0x00,0x00,0x00,0x00,0x00,0x07,0xf0,0x00,0x00,0x00,0x00};
+
+// ============================================================================
+// HARDWARE
+// ============================================================================
+Adafruit_ILI9341 tft = Adafruit_ILI9341(TFT_CS, TFT_DC);
+XPT2046_Touchscreen ts(TOUCH_CS);
+
+// ============================================================================
+// MEASUREMENT STATE (volatile — ISR)
+// ============================================================================
+volatile unsigned long pulseCount      = 0;
+volatile unsigned long totalPulseCount  = 0;
+volatile unsigned long lastIntMicros   = 0;
+
+// ============================================================================
+// SETTINGS (EEPROM)
+// ============================================================================
+uint8_t  doseUnits       = 0;
+uint8_t  alarmThreshold  = 5;
+uint16_t tubeSensitivity = 175;
+uint16_t deadTime        = 190;
+uint16_t backgroundCPM   = 0;
+uint8_t  buzzerEnabled   = 1;
+uint8_t  ledEnabled      = 1;
+
+// ============================================================================
+// DERIVED MEASUREMENTS
+// ============================================================================
+float    doseRate        = 0.0f;
+float    totalDose       = 0.0f;
+float    avgCPM          = 0.0f;
+float    uncertaintyCPM  = 0.0f;
+uint8_t  doseLevel       = 0;
+uint8_t  prevDoseLevel   = 255;
+char     lastDoseStr[12] = "";
+
+// ============================================================================
+// RING BUFFER & INTEGRATION
+// ============================================================================
+uint16_t cpmRing[60];
+uint8_t  ringIndex       = 0;
+uint8_t  integrationMode = 1;
+float    slowSum         = 0.0f;
+uint16_t slowCount       = 0;
+uint16_t lastValidCount  = 0;
+
+// ============================================================================
+// TIMING & PULSE OUTPUT
+// ============================================================================
+unsigned long currentMillis    = 0;
+unsigned long prevSecMillis    = 0;
+unsigned long pulseOffMicros   = 0;
+unsigned long lastPulseTotal   = 0;
+bool buzzerActive = false;
+bool ledActive    = false;
+
+// ============================================================================
+// UI STATE
+// ============================================================================
+uint8_t  page             = 0;
+uint8_t  selectedCalParam = 0;
+uint8_t  calGuidePg       = 0;    // Calibration guide page number
+bool     wasTouched       = false;
+int      touchX = 0, touchY = 0;
+bool     dashboardBuilt   = false;
+
+// ============================================================================
+// BATTERY
+// ============================================================================
+uint8_t  batteryPercent   = 0;
+uint8_t  batUpdateCtr      = 0;
+float    batterySmoothed   = -1;  // -1 = not initialized
+
+// ============================================================================
+// TIMED COUNT
+// ============================================================================
+uint8_t  timedInterval    = 5;
+unsigned long timedStartMillis = 0;
+unsigned long timedElapsed     = 0;
+bool     timedRunning     = false;
+bool     timedComplete    = false;
+unsigned long timedCountsAtStart = 0;
+
+// ============================================================================
+// EEPROM ADDRESSES (10 bytes)
+// ============================================================================
+// 0:doseUnits 1:alarmThreshold 2-3:tubeSensitivity 4-5:deadTime
+// 6-7:backgroundCPM 8:buzzerEnabled 9:ledEnabled
+
+// ============================================================================
+// FORWARD DECLARATIONS
+// ============================================================================
+void IRAM_ATTR isr();
+
+float  correctDeadTime(float cps, uint16_t deadUs);
+float  calcDoseRate(float cpm);
+float  calcUncertainty(float cpm, uint16_t periodSec);
+void   formatDose(char* buf, float dose);
+uint8_t getDoseLevel(float dr);
+
+void loadSettings();
+void saveSettings();
+
+void drawFrame(const char* title);
 void drawBackButton();
-void drawCancelButton();
-void drawCloseButton();
-void drawBlankDialogueBox();
+void drawBattery(int batX, int batY);
 
-long EEPROMReadlong(long address);
-void EEPROMWritelong(int address, long value); // logging functions
-void createJsonFile();
-void clearLogs();
+void drawDashboard();
+void drawSettingsMenu();
+void drawUnitsPage();
+void drawAlertPage();
+void drawCalibrationPage();
+void drawCalibrationGuide();
+void drawTimedCountSetup();
+void drawTimedCountRunning();
+void drawTimedComplete();
+void updateTimedCountDisplay();
+void drawAboutPage();
 
-void setup()
-{
-  Serial.begin(38400);
-  ts.begin();
-  ts.setRotation(2);
+// Dashboard partial update helpers
+void updateDashboardData();
+void redrawTrendGraph();
+void redrawToolbar();
 
-  tft.begin();
-  tft.setRotation(2);
-  tft.fillScreen(ILI9341_BLACK);
+// Page handlers
+void handlePage0();
+void handlePage1();
+void handlePage2();
+void handlePage3();
+void handlePage4();
+void handlePage5();
+void handlePage6();
+void handlePage7();
+void handlePage8();
 
-  pinMode(D0, OUTPUT); // buzzer switch
-  pinMode(D3, OUTPUT); // LED
-  digitalWrite(D3, LOW);
-  digitalWrite(D0, LOW);
+void handlePulseOutput();
+void startTimedCount();
+void stopTimedCount();
+bool readTouch();
 
-  EEPROM.begin(4096);   // initialize emulated EEPROM sector with 4 kb
+// Text helpers — default font (6x8 per char at size 1)
+int textW(const char* s, uint8_t sz) { return strlen(s) * 6 * sz; }
+int textH(uint8_t sz)               { return 8 * sz; }
 
-  doseUnits = EEPROM.read(saveUnits);
-  alarmThreshold = EEPROM.read(saveAlertThreshold);
-  conversionFactor = EEPROM.read(saveCalibration);
-  deviceMode = EEPROM.read(saveDeviceMode);
-  isLogging = EEPROM.read(saveLoggingMode);
-  addr = EEPROMReadlong(96);
+// ============================================================================
+// ISR
+// ============================================================================
+void IRAM_ATTR isr() {
+    unsigned long now = micros();
+    if ((now - lastIntMicros) > 50) {
+        pulseCount++;
+        totalPulseCount++;
+        lastIntMicros = now;
+    }
+}
 
-  SSIDLength = EEPROM.read(saveSSIDLen);
-  passwordLength = EEPROM.read(savePWLen);
-  channelIDLength = EEPROM.read(saveIDLen);
-  writeAPILength = EEPROM.read(saveAPILen);
+// ============================================================================
+// MEASUREMENT MATH
+// ============================================================================
+float correctDeadTime(float cps, uint16_t deadUs) {
+    if (cps <= 0.0f) return 0.0f;
+    float tau = (float)deadUs / 1000000.0f;
+    float denom = 1.0f - cps * tau;
+    if (denom <= 0.01f) return cps * 1.5f;
+    float corrected = cps / denom;
+    if (corrected > cps * 1.5f) corrected = cps * 1.5f;
+    return corrected;
+}
 
-  for (int i = 10; i < 10 + SSIDLength; i++)
-  {
-    ssid[i - 10] = EEPROM.read(i);
-  }
-  Serial.println(ssid);
+float calcDoseRate(float cpm) {
+    float eff = cpm - (float)backgroundCPM;
+    if (eff < 0.0f) eff = 0.0f;
+    float rate = eff / (float)tubeSensitivity;
+    if (doseUnits == 1) rate /= 10.0f;
+    return rate;
+}
 
-  for (int j = 30; j < 30 + passwordLength; j++)
-  {
-    password[j - 30] = EEPROM.read(j);
-  }
-  Serial.println(password);
+float calcUncertainty(float cpm, uint16_t periodSec) {
+    if (periodSec == 0) return 0.0f;
+    float n = cpm * (float)periodSec / 60.0f;
+    if (n <= 0.0f) return 0.0f;
+    return sqrt(n) * 60.0f / (float)periodSec;
+}
 
-  for (int k = 50; k < 50 + channelIDLength; k++)
-  {
-    channelID[k - 50] = EEPROM.read(k);
-  }
-  Serial.println(channelID);
+void formatDose(char* buf, float dose) {
+    if (dose < 0.01f)       sprintf(buf, "0.00");
+    else if (dose < 1.0f)   sprintf(buf, "%.2f", dose);
+    else if (dose < 10.0f)  sprintf(buf, "%.2f", dose);
+    else if (dose < 100.0f) sprintf(buf, "%.1f", dose);
+    else                    sprintf(buf, "%.0f", dose);
+}
 
-  for (int l = 70; l < 70 + writeAPILength; l++)
-  {
-    channelAPIkey[l - 70] = EEPROM.read(l);
-  }
-  Serial.println(channelAPIkey);
+uint8_t getDoseLevel(float dr) {
+    if (dr < 0.5f) return 0;
+    if (dr < (float)alarmThreshold) return 1;
+    return 2;
+}
 
-  attachInterrupt(interruptPin, isr, FALLING);
+// ============================================================================
+// EEPROM
+// ============================================================================
+void loadSettings() {
+    EEPROM.begin(512);
+    uint8_t v;
+    v = EEPROM.read(0); doseUnits = (v <= 1) ? v : 0;
+    v = EEPROM.read(1); alarmThreshold = (v >= 2 && v <= 100) ? v : 5;
+    uint8_t lo = EEPROM.read(2), hi = EEPROM.read(3);
+    uint16_t tv = ((uint16_t)hi << 8) | lo;
+    tubeSensitivity = (tv >= 1 && tv <= 999) ? tv : 175;
+    lo = EEPROM.read(4); hi = EEPROM.read(5);
+    tv = ((uint16_t)hi << 8) | lo;
+    deadTime = (tv >= 10 && tv <= 2000) ? tv : 190;
+    lo = EEPROM.read(6); hi = EEPROM.read(7);
+    tv = ((uint16_t)hi << 8) | lo;
+    backgroundCPM = (tv <= 500) ? tv : 0;
+    v = EEPROM.read(8); buzzerEnabled = (v <= 1) ? v : 1;
+    v = EEPROM.read(9); ledEnabled = (v <= 1) ? v : 1;
+    EEPROM.end();
+}
 
-  drawHomePage();
+void saveSettings() {
+    EEPROM.begin(512);
+    EEPROM.write(0, doseUnits);
+    EEPROM.write(1, alarmThreshold);
+    EEPROM.write(2, tubeSensitivity & 0xFF);
+    EEPROM.write(3, (tubeSensitivity >> 8) & 0xFF);
+    EEPROM.write(4, deadTime & 0xFF);
+    EEPROM.write(5, (deadTime >> 8) & 0xFF);
+    EEPROM.write(6, backgroundCPM & 0xFF);
+    EEPROM.write(7, (backgroundCPM >> 8) & 0xFF);
+    EEPROM.write(8, buzzerEnabled);
+    EEPROM.write(9, ledEnabled);
+    EEPROM.commit();
+    EEPROM.end();
+}
 
-  if (!deviceMode)
-  {
-    WiFi.mode( WIFI_OFF );                // turn off wifi
-    WiFi.forceSleepBegin();
-    delay(1);
-  }
-  else
-  {
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(ssid, password);
-    drawBlankDialogueBox();
+// ============================================================================
+// TOUCH INPUT
+// ============================================================================
+bool readTouch() {
+    if (!ts.touched()) { wasTouched = false; return false; }
+    if (wasTouched) return false;
+    wasTouched = true;
+    TS_Point p = ts.getPoint();
+    touchX = map(p.x, TS_MINX, TS_MAXX, 0, 239);
+    touchY = map(p.y, TS_MINY, TS_MAXY, 0, 319);
+    if (touchX < 0) touchX = 0;
+    if (touchX > 239) touchX = 239;
+    if (touchY < 0) touchY = 0;
+    if (touchY > 319) touchY = 319;
+    return true;
+}
+
+// ============================================================================
+// UI TOOLKIT — default font only, size 1 = 6x8, size 2 = 12x16, size 3 = 18x24
+// ============================================================================
+void drawFrame(const char* title) {
+    tft.fillRect(0, 0, 240, 24, C_HEADER_BG);
+    tft.fillRect(0, 24, 240, 296, C_BG);
+    tft.drawFastHLine(0, 24, 240, C_ACCENT);
+    tft.setTextSize(2);
+    tft.setTextColor(C_ACCENT2, C_HEADER_BG);
+    int tw = textW(title, 2);
+    tft.setCursor((240 - tw) / 2, 4);
+    tft.print(title);
+}
+
+void drawBackButton() {
+    tft.fillRoundRect(3, 284, 58, 32, 5, C_BTN_BG);
+    tft.drawRoundRect(3, 284, 58, 32, 5, C_ACCENT);
+    tft.drawBitmap(3 + (58 - 18) / 2, 284 + (32 - 14) / 2,
+                  backArrow, 18, 14, C_WHITE);
+}
+
+void drawBattery(int batX, int batY) {
+    tft.drawRect(batX, batY, 24, 10, C_WHITE);
+    tft.fillRect(batX + 24, batY + 2, 2, 6, C_WHITE);
+    uint8_t fw = map(batteryPercent, 0, 100, 0, 20);
+    uint16_t c = C_GREEN;
+    if (batteryPercent < 30) c = C_RED;
+    else if (batteryPercent < 60) c = C_YELLOW;
+    if (fw > 0) tft.fillRect(batX + 2, batY + 1, fw, 8, c);
     tft.setTextSize(1);
-    tft.setFont(&FreeSans9pt7b);
-    tft.setTextColor(ILI9341_WHITE);
-    
-    tft.setCursor(38, 140);
-    tft.println("Connecting to WiFi..");
-
-    while ((WiFi.status() != WL_CONNECTED) && (attempts < 300))
-    {
-      delay(100);
-      attempts ++;
-    }
-    if (attempts >= 300)
-    {
-      deviceMode = 0; 
-      tft.setCursor(45, 200);
-      tft.println("Failed to connect.");
-      delay(1000);
-    }
-    else
-    {
-      tft.setCursor(68, 200);
-      tft.println("Connected!");
-      delay(1000);
-    }
-    drawHomePage();
-  }
+    tft.setTextColor(C_WHITE, C_HEADER_BG);
+    char pct[8]; sprintf(pct, "%u%%", batteryPercent);
+    int pw = textW(pct, 1);
+    tft.setCursor(batX - pw - 4, batY + 1);
+    tft.print(pct);
 }
 
-void loop()
-{
-  if (page == 0) // homepage
-  {
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+    Serial.begin(38400);
+    delay(100);
+
+    tft.begin();
+    tft.setRotation(2);
+    tft.fillScreen(C_BLACK);
+
+    // Splash — logo 65x61 centered + title
+    tft.drawBitmap((240 - 65) / 2, 111, splashLogo, 65, 61, C_GREEN);
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_BG);
+    const char* title = "GEIGER COUNTER";
+    tft.setCursor((240 - textW(title, 2)) / 2, 186);
+    tft.print(title);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_BG);
+    const char* ver = "SBM-20  /  v3.2";
+    tft.setCursor((240 - textW(ver, 1)) / 2, 206);
+    tft.print(ver);
+
+    ts.begin();
+    ts.setRotation(2);
+
+    pinMode(BUZZER_PIN, OUTPUT);
+    pinMode(LED_PIN, OUTPUT);
+    digitalWrite(BUZZER_PIN, LOW);
+    digitalWrite(LED_PIN, LOW);
+    pinMode(INT_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(INT_PIN), isr, FALLING);
+
+    loadSettings();
+    for (uint8_t i = 0; i < 60; i++) cpmRing[i] = 0;
+
+    // Initial battery read — avoid showing 0% on boot
+    int raw = analogRead(BATTERY_PIN);
+    raw = constrain(raw, 607, 797);
+    batterySmoothed = (float)raw;
+    if      (raw >= 797) batteryPercent = 100;
+    else if (raw >= 771) batteryPercent = map(raw, 771, 797, 80, 100);
+    else if (raw >= 740) batteryPercent = map(raw, 740, 771, 60, 80);
+    else if (raw >= 714) batteryPercent = map(raw, 714, 740, 40, 60);
+    else if (raw >= 693) batteryPercent = map(raw, 693, 714, 20, 40);
+    else if (raw >= 670) batteryPercent = map(raw, 670, 693, 10, 20);
+    else if (raw >= 607) batteryPercent = map(raw, 607, 670, 0, 10);
+    else                 batteryPercent = 0;
+
+    delay(600);
+    drawDashboard();
+    dashboardBuilt = true;
+
+    Serial.println(F("GC-20 v3.2 ready"));
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
     currentMillis = millis();
-    if (currentMillis - previousMillis >= 1000)
-    {
-      previousMillis = currentMillis;
-
-      batteryUpdateCounter ++;     
-
-      if (batteryUpdateCounter == 30){         // update battery level every 30 seconds. Prevents random fluctations of battery level.
-
-        batteryInput = analogRead(A0);
-        batteryInput = constrain(batteryInput, 590, 800);
-        batteryPercent = map(batteryInput, 590, 800, 0, 100);
-        batteryMapped = map(batteryPercent, 100, 0, 212, 233);
-
-        tft.fillRect(212, 6, 22, 10, ILI9341_BLACK);
-        if (batteryPercent < 10)
-        {
-          tft.fillRect(batteryMapped, 6, (234 - batteryMapped), 10, ILI9341_RED);
-        }
-        else
-        {
-          tft.fillRect(batteryMapped, 6, (234 - batteryMapped), 10, ILI9341_GREEN); // draws battery icon
-        }
-        
-        batteryUpdateCounter = 0;
-        Serial.println(batteryInput);
-        Serial.println(batteryPercent);
-      }
-
-      count[i] = currentCount;
-      i++;
-      fastCount[j] = currentCount; // keep concurrent arrays of counts. Use only one depending on user choice
-      j++;
-      slowCount[k] = currentCount;
-      k++;
-
-      if (i == 61)
-      {
-        i = 0;
-      }
-
-      if (j == 6)
-      {
-        j = 0;
-      }
-
-      if (k == 181)
-      {
-        k = 0;
-      }
-
-      if (integrationMode == 2)
-      {
-        averageCount = (currentCount - slowCount[k]) / 3;
-      }
-
-      if (integrationMode == 1)
-      {
-        averageCount = (currentCount - fastCount[j]) * 12;
-      }
-
-      else if (integrationMode == 0)
-      {
-        averageCount = currentCount - count[i]; // count[i] stores the value from 60 seconds ago
-      }
-
-      averageCount = ((averageCount) / (1 - 0.00000333 * float(averageCount))); // accounts for dead time of the geiger tube. relevant at high count rates
-
-      if (doseUnits == 0)
-      {
-        doseRate = averageCount / float(conversionFactor);
-        totalDose = cumulativeCount / (60 * float(conversionFactor));
-        
-      }
-      else if (doseUnits == 1)
-      {
-        doseRate = averageCount / float(conversionFactor * 10.0);
-        totalDose = cumulativeCount / (60 * float(conversionFactor * 10.0)); // 1 mRem == 10 uSv
-        
-      }
-
-      if (averageCount < conversionFactor/2) // 0.5 uSv/hr
-        doseLevel = 0; // determines alert level displayed on homescreen
-      else if (averageCount < alarmThreshold * conversionFactor)
-        doseLevel = 1;
-      else
-        doseLevel = 2;
-
-      if (doseRate < 10.0)
-      {
-        dtostrf(doseRate, 4, 2, dose); // display two digits after the decimal point if value is less than 10
-      }
-      else if ((doseRate >= 10) && (doseRate < 100))
-      {
-        dtostrf(doseRate, 4, 1, dose); // display one digit after decimal point when dose is greater than 10
-      }
-      else if ((doseRate >= 100))
-      {
-        dtostrf(doseRate, 4, 0, dose); // whole numbers only when dose is higher than 100
-      }
-      else {
-        dtostrf(doseRate, 4, 0, dose);  // covers the rare edge case where the dose rate is sometimes errorenously calculated to be negative
-      }
-      
-      tft.setFont();
-      tft.setCursor(44, 52);
-      tft.setTextSize(5);
-      tft.setTextColor(ILI9341_WHITE, DOSEBACKGROUND);
-      tft.println(dose); // display effective dose rate
-      tft.setTextSize(1);
-
-      tft.setFont();
-      tft.setCursor(73, 122);
-      tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-      tft.setTextSize(3);
-      tft.println(averageCount); // Display CPM
-
-      if (averageCount < 10)
-      {
-        tft.fillRect(90, 120, 144, 25, ILI9341_BLACK); // erase numbers that may have been left from previous high readings
-      }
-      else if (averageCount < 100)
-      {
-        tft.fillRect(107, 120, 127, 25, ILI9341_BLACK);
-      }
-      else if (averageCount < 1000)
-      {
-        tft.fillRect(124, 120, 110, 25, ILI9341_BLACK);
-      }
-      else if (averageCount < 10000)
-      {
-        tft.fillRect(141, 120, 93, 25, ILI9341_BLACK);
-      }
-      else if (averageCount < 100000)
-      {
-        tft.fillRect(160, 120, 74, 25, ILI9341_BLACK);
-      }
-      tft.setCursor(80, 192);
-      tft.setTextSize(2);
-      tft.setTextColor(ILI9341_WHITE, 0x630C);
-      tft.println(cumulativeCount); // display total counts since reset
-
-      tft.setCursor(80, 222);
-      tft.println(totalDose); // display cumulative dose
-
-      if (doseLevel != previousDoseLevel) // only update alert level if it changed. This prevents flicker
-      {
-        if (doseLevel == 0)
-        {
-          tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_WHITE);
-          tft.fillRoundRect(3, 94, 234, 21, 3, 0x2DC6);
-          tft.setCursor(15, 104);
-          tft.setFont(&FreeSans9pt7b);
-          tft.setTextColor(ILI9341_WHITE);
-          tft.setTextSize(1);
-          tft.println("NORMAL BACKGROUND");
-
-          previousDoseLevel = doseLevel;
-        }
-        else if (doseLevel == 1)
-        {
-          tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_WHITE);
-          tft.fillRoundRect(3, 94, 234, 21, 3, 0xCE40);
-          tft.setCursor(29, 104);
-          tft.setFont(&FreeSans9pt7b);
-          tft.setTextColor(ILI9341_WHITE);
-          tft.setTextSize(1);
-          tft.println("ELEVATED ACTIVITY");
-
-          previousDoseLevel = doseLevel;
-        }
-        else if (doseLevel == 2)
-        {
-          tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_RED);
-          tft.fillRoundRect(3, 94, 234, 21, 3, 0xB8A2);
-          tft.setCursor(17, 104);
-          tft.setFont(&FreeSans9pt7b);
-          tft.setTextColor(ILI9341_WHITE);
-          tft.setTextSize(1);
-          tft.println("HIGH RADIATION LEVEL");
-
-          previousDoseLevel = doseLevel;
-        }
-      }
-      Serial.println(currentCount);
-    } 
-    // end of millis()-controlled block that runs once every second. The rest of the code on page 0 runs every loop
-    if (currentCount > previousCount)
-    {
-      if (ledSwitch)
-        digitalWrite(D3, HIGH); // trigger buzzer and led if they are activated
-      if (buzzerSwitch)
-        digitalWrite(D0, HIGH);
-      previousCount = currentCount;
-      previousMicros = micros();
+    handlePulseOutput();
+    switch (page) {
+        case 0: handlePage0(); break;
+        case 1: handlePage1(); break;
+        case 2: handlePage2(); break;
+        case 3: handlePage3(); break;
+        case 4: handlePage4(); break;
+        case 5: handlePage5(); break;
+        case 6: handlePage6(); break;
+        case 7: handlePage7(); break;
+        case 8: handlePage8(); break;
     }
-    currentMicros = micros();
-    if (currentMicros - previousMicros >= 200)
-    {
-      digitalWrite(D3, LOW);
-      digitalWrite(D0, LOW);
-      previousMicros = currentMicros;
+    delay(5);
+}
+
+// ============================================================================
+// PULSE OUTPUT
+// ============================================================================
+void handlePulseOutput() {
+    unsigned long cur = totalPulseCount;
+    if (cur != lastPulseTotal) {
+        lastPulseTotal = cur;
+        if (ledEnabled)    { digitalWrite(LED_PIN, HIGH); ledActive = true; }
+        if (buzzerEnabled) { digitalWrite(BUZZER_PIN, HIGH); buzzerActive = true; }
+        pulseOffMicros = micros();
+    }
+    if (micros() - pulseOffMicros >= 200) {
+        if (ledActive)    { digitalWrite(LED_PIN, LOW); ledActive = false; }
+        if (buzzerActive) { digitalWrite(BUZZER_PIN, LOW); buzzerActive = false; }
+    }
+}
+
+// ============================================================================
+// PAGE 0 — DASHBOARD HANDLER
+// ============================================================================
+void handlePage0() {
+    if (currentMillis - prevSecMillis >= 1000) {
+        prevSecMillis = currentMillis;
+
+        noInterrupts();
+        unsigned long cts = pulseCount;
+        pulseCount = 0;
+        interrupts();
+
+        float cps = (float)cts;
+        float corrCPS = correctDeadTime(cps, deadTime);
+        uint16_t cpmNow = (uint16_t)(corrCPS * 60.0f);
+
+        if (avgCPM > 10.0f && (float)cpmNow > avgCPM * 5.0f) {
+            cpmNow = lastValidCount;
+        } else {
+            lastValidCount = cpmNow;
+        }
+
+        cpmRing[ringIndex] = cpmNow;
+        ringIndex = (ringIndex + 1) % 60;
+
+        float sum = 0;
+        switch (integrationMode) {
+            case 0:
+                for (uint8_t i = 0; i < 10; i++)
+                    sum += cpmRing[(ringIndex + 60 - 1 - i) % 60];
+                avgCPM = sum / 10.0f;
+                break;
+            case 1:
+                for (uint8_t i = 0; i < 60; i++) sum += cpmRing[i];
+                avgCPM = sum / 60.0f;
+                break;
+            case 2:
+                slowSum += (float)cpmNow; slowCount++;
+                if (slowCount >= 300) {
+                    avgCPM = slowSum / 300.0f;
+                    slowSum = avgCPM * 150.0f; slowCount = 150;
+                } else if (slowCount > 0) {
+                    avgCPM = slowSum / (float)slowCount;
+                }
+                break;
+            default:
+                avgCPM = (float)cpmNow;
+                break;
+        }
+
+        doseRate = calcDoseRate(avgCPM);
+
+        if (integrationMode == 0)      uncertaintyCPM = calcUncertainty(avgCPM, 10);
+        else if (integrationMode == 1) uncertaintyCPM = calcUncertainty(avgCPM, 60);
+        else                           uncertaintyCPM = calcUncertainty(avgCPM, slowCount < 300 ? slowCount : 300);
+
+        totalDose = (float)totalPulseCount /
+            (60.0f * (float)tubeSensitivity * (doseUnits == 1 ? 10.0f : 1.0f));
+
+        doseLevel = getDoseLevel(doseRate);
+
+        batUpdateCtr++;
+        if (batUpdateCtr >= 5) {
+            batUpdateCtr = 0;
+            int raw = analogRead(BATTERY_PIN);
+            // Exponential moving average
+            if (batterySmoothed < 0) {
+                batterySmoothed = (float)raw;
+            } else {
+                batterySmoothed = batterySmoothed * 0.7f + (float)raw * 0.3f;
+            }
+            // Li-Ion non-linear: Wemos D1 Mini (220k/100k internal) + 220k external
+            // raw=607(3.2V)..797(4.2V), cap at 100 for USB charging (5V→raw≈950)
+            int r = (int)batterySmoothed;
+            if      (r >= 797) batteryPercent = 100;
+            else if (r >= 771) batteryPercent = map(r, 771, 797, 80, 100);
+            else if (r >= 740) batteryPercent = map(r, 740, 771, 60, 80);
+            else if (r >= 714) batteryPercent = map(r, 714, 740, 40, 60);
+            else if (r >= 693) batteryPercent = map(r, 693, 714, 20, 40);
+            else if (r >= 670) batteryPercent = map(r, 670, 693, 10, 20);
+            else if (r >= 607) batteryPercent = map(r, 607, 670, 0, 10);
+            else               batteryPercent = 0;
+            // Clamp final value
+            if (batteryPercent > 100) batteryPercent = 100;
+        }
+
+        updateDashboardData();
     }
 
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched) // A way of "debouncing" the touchscreen. Prevents multiple inputs from single touch
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0); // get touch point and map to screen pixels
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
+    if (!readTouch()) return;
 
-      if ((x > 162 && x < 238) && (y > 259 && y < 318))
-      {
-        integrationMode ++;
-        if (integrationMode == 3)
-        {
-          integrationMode = 0;
+    // Toolbar Row 1  (y=233 h=46)
+    if (touchY >= 233 && touchY <= 279) {
+        if (touchX >= 3 && touchX <= 77) {
+            page = 1; dashboardBuilt = false; drawSettingsMenu(); return;
         }
-        currentCount = 0;
-        previousCount = 0;
-        for (int a = 0; a < 61; a++) // reset counts when integretation speed is changed
-        {
-          count[a] = 0;
+        if (touchX >= 83 && touchX <= 157) {
+            integrationMode = (integrationMode + 1) % 3;
+            slowSum = avgCPM * 150.0f; slowCount = 150;
+            redrawToolbar(); return;
         }
-        for (int b = 0; b < 6; b++)
-        {
-          fastCount[b] = 0;
+        if (touchX >= 163 && touchX <= 236) {
+            page = 6; dashboardBuilt = false; drawTimedCountSetup(); return;
         }
-        for (int c = 0; c < 181; c++)
-        {
-          slowCount[c] = 0;
-        }
-        if (integrationMode == 0) // change button based on touch and previous state
-        {
-          tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-          tft.setFont(&FreeSans12pt7b);
-          tft.setTextSize(1);
-          tft.setCursor(180, 283);
-          tft.println("INT");
-          tft.setCursor(177, 309);
-          tft.println("60 s");
-        }
-        else if (integrationMode == 1)
-        {
-          tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-          tft.setFont(&FreeSans12pt7b);
-          tft.setTextSize(1);
-          tft.setCursor(180, 283);
-          tft.println("INT");
-          tft.setCursor(184, 309);
-          tft.println("5 s");
-        }
-        else if (integrationMode == 2)
-        {
-          tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-          tft.setFont(&FreeSans12pt7b);
-          tft.setTextSize(1);
-          tft.setCursor(180, 283);
-          tft.println("INT");
-          tft.setCursor(169, 309);
-          tft.println("180 s");
-        }
-      }
-      else if ((x > 64 && x < 159) && (y > 259 && y < 318)) // timed count 
-      {
-        page = 6;
-        drawTimedCountPage();
-      }
-      else if ((x > 190 && x < 238) && (y > 151 && y < 202)) // toggle LED
-      {
-        ledSwitch = !ledSwitch;
-        if (ledSwitch)
-        {
-          tft.fillRoundRect(190, 151, 46, 51, 3, 0x6269);
-          tft.drawBitmap(190, 153, ledOnBitmap, 45, 45, ILI9341_WHITE);
-        }
-        else
-        {
-          tft.fillRoundRect(190, 151, 46, 51, 3, 0x6269);
-          tft.drawBitmap(190, 153, ledOffBitmap, 45, 45, ILI9341_WHITE);
-        }
-      }
-      else if ((x > 190 && x < 238) && (y > 205 && y < 256)) // toggle buzzer
-      {
-        buzzerSwitch = !buzzerSwitch;
-        if (buzzerSwitch)
-        {
-          tft.fillRoundRect(190, 205, 46, 51, 3, 0x6269);
-          tft.drawBitmap(190, 208, buzzerOnBitmap, 45, 45, ILI9341_WHITE);
-        }
-        else
-        {
-          tft.fillRoundRect(190, 205, 46, 51, 3, 0x6269);
-          tft.drawBitmap(190, 208, buzzerOffBitmap, 45, 45, ILI9341_WHITE);
-        }
-      }
-      else if ((x > 3 && x < 61) && (y > 259 && y < 316)) // settings button pressed
-      {
-        page = 1;
-        drawSettingsPage();
-      }
     }
-    
-    if (isLogging)
-    {
-      if(addr < 2100)
-      {
-        currentLogTime = millis();
-        if ((currentLogTime - previousLogTime) >= 600000)   // log every 10 minutes
-        {
-          EEPROMWritelong(addr, averageCount);
-          addr += 4;
-          EEPROMWritelong(96, addr); // write current address number to an adress just before the logged data
-          previousLogTime = currentLogTime;
-          EEPROM.commit();
+    // Toolbar Row 2  (y=283 h=32)
+    if (touchY >= 283 && touchY <= 315) {
+        if (touchX >= 3 && touchX <= 115) {
+            buzzerEnabled = !buzzerEnabled; saveSettings(); redrawToolbar(); return;
         }
-      }
+        if (touchX >= 125 && touchX <= 236) {
+            ledEnabled = !ledEnabled; saveSettings(); redrawToolbar(); return;
+        }
     }
-    if (deviceMode)    // deviceMode is 1 when in monitoring station mode. Uploads CPM to thingspeak every 5 minutes
-    {
-      currentUploadTime = millis();
-      if ((currentUploadTime - previousUploadTime) > 300000)
-      {
-        previousUploadTime = currentUploadTime;
-        if (client.connect(server, 80))
-        {
-          String postStr = channelAPIkey;
-          postStr += "&field2=";
-          postStr += String(averageCount);
-          postStr += "\r\n\r\n";
-          char temp[50] = "X-THINGSPEAKAPIKEY:";
-          strcat(temp, channelAPIkey);
-          strcat(temp, "\n");
-          client.print("POST /update HTTP/1.1\n");
-          client.print("Host: api.thingspeak.com\n");
-          client.print("Connection: close\n");
-          client.print(temp);
-          client.print("Content-Type: application/x-www-form-urlencoded\n");
-          client.print("Content-Length: ");
-          client.print(postStr.length());
-          client.print("\n\n");
-          client.print(postStr);
-          Serial.println(postStr);
-        }
-        client.stop();
-      }
+}
+
+// ============================================================================
+// DASHBOARD — FULL DRAW (page entry only)
+// ============================================================================
+void drawDashboard() {
+    tft.fillScreen(C_BG);
+
+    // Status bar (y=0-20)
+    tft.fillRect(0, 0, 240, 19, C_HEADER_BG);
+    tft.setTextSize(2);
+    tft.setTextColor(C_ACCENT2, C_HEADER_BG);
+    tft.setCursor(4, 2);
+
+    // Radiation icons centered
+    tft.drawBitmap(102, 0, gammaIcon, 12, 18, C_WHITE);
+    tft.drawBitmap(122, 0, betaIcon, 18, 18, C_YELLOW);
+
+    // Battery
+    drawBattery(210, 4);
+
+    // Initial card + strip
+    uint16_t initBg = C_CARD_OK;
+    tft.fillRoundRect(3, 23, 234, 82, 6, initBg);
+    tft.drawRoundRect(3, 23, 234, 82, 6, C_GREEN);
+
+    // Static graph border (drawn once, not cleared during updates)
+    tft.drawRect(3, 148, 234, 64, C_DIM);
+
+    updateDashboardData();
+    redrawToolbar();
+    prevDoseLevel = 255;
+    strcpy(lastDoseStr, "");
+}
+
+// ============================================================================
+// DASHBOARD — PARTIAL UPDATE (every second)
+// ============================================================================
+void updateDashboardData() {
+    uint16_t cardBg, cardBorder;
+    switch (doseLevel) {
+        case 0: cardBg = C_CARD_OK; cardBorder = C_GREEN; break;
+        case 1: cardBg = C_CARD_WARN; cardBorder = C_YELLOW; break;
+        default: cardBg = C_CARD_DANGER; cardBorder = C_RED; break;
     }
-  }
-  else if (page == 1) // settings page. all display elements are drawn when drawSettingsPage() is called
-  {
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
 
-      if ((x > 4 && x < 62) && (y > 271 && y < 315)) // back button. draw homepage, reset counts and go back
-      {
-        currentCount = 0;
-        previousCount = 0;
-        for (int a = 0; a < 61; a++)
-        {
-          count[a] = 0; // counts need to be reset to prevent errorenous readings
+    bool lvChg = (doseLevel != prevDoseLevel);
+
+    // Card background + unit label + status strip — only on level change
+    if (lvChg) {
+        tft.fillRoundRect(3, 23, 234, 82, 4, cardBg);
+        tft.drawRoundRect(3, 23, 234, 82, 4, cardBorder);
+
+        tft.setTextSize(2);
+        tft.setTextColor(C_WHITE, cardBg);
+        const char* us = doseUnits == 0 ? "uSv/h" : "mR/h";
+        int uw = textW(us, 2);
+        tft.setCursor(3 + (234 - uw) / 2, 74);
+        tft.print(us);
+
+        // Status strip
+        uint16_t sc; const char* st;
+        switch (doseLevel) {
+            case 0: sc = C_GREEN;  st = "NORMAL"; break;
+            case 1: sc = C_YELLOW; st = "ELEVATED"; break;
+            default: sc = C_RED;  st = "HIGH RADIATION"; break;
         }
-        for (int b = 0; b < 6; b++)
-        {
-          fastCount[b] = 0;
-        }
-        for (int c = 0; c < 181; c++)
-        {
-          slowCount[c] = 0;
-        }
-        page = 0;
-        drawHomePage();
-      }
-      else if ((x > 3 && x < 234) && (y > 64 && y < 108))
-      {
-        page = 2;
-        drawUnitsPage();
-      }
-      else if ((x > 3 && x < 234) && (y > 114 && y < 158))
-      {
-        page = 3;
-        drawAlertPage();
-      }
-      else if ((x > 3 && x < 234) && (y > 164 && y < 208))
-      {
-        page = 4;
-        drawCalibrationPage();
-      }
-      else if ((x > 3 && x < 234) && (y > 214 && y < 268))
-      {
-        page = 5;
-        drawWifiPage();
-      }
-    }
-  }
-  else if (page == 2) // units page
-  {
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
-
-      if ((x > 4 && x < 62) && (y > 271 && y < 315)) // back button
-      {
-        page = 1;
-        if (EEPROM.read(saveUnits) != doseUnits) // check current EEPROM value and only write if new value is different
-        {
-          EEPROM.write(saveUnits, doseUnits); // save current units to EEPROM during exit. This will be retrieved at startup
-          EEPROM.commit();
-        }
-        drawSettingsPage();
-      }
-      else if ((x > 4 && x < 234) && (y > 70 && y < 120))
-      {
-        doseUnits = 0;
-        tft.fillRoundRect(4, 71, 232, 48, 4, 0x2A86);
-        tft.setCursor(30, 103);
-        tft.println("Sieverts (uSv/hr)");
-
-        tft.fillRoundRect(4, 128, 232, 48, 4, ILI9341_BLACK);
-        tft.setCursor(47, 160);
-        tft.println("Rems (mR/hr)");
-      }
-      else if ((x > 4 && x < 234) && (y > 127 && y < 177))
-      {
-        doseUnits = 1;
-        tft.fillRoundRect(4, 71, 232, 48, 4, ILI9341_BLACK);
-        tft.setCursor(30, 103);
-        tft.println("Sieverts (uSv/hr)");
-
-        tft.fillRoundRect(4, 128, 232, 48, 4, 0x2A86);
-        tft.setCursor(47, 160);
-        tft.println("Rems (mR/hr)");
-      }
-    }
-  }
-  else if (page == 3)        // alert thresold page
-  {
-    tft.setFont();
-    tft.setTextSize(3);
-    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setCursor(151, 146);
-    tft.println(alarmThreshold);
-    if (alarmThreshold < 10)
-      tft.fillRect(169, 146, 22, 22, ILI9341_BLACK);
-
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
-
-      if ((x > 4 && x < 62) && (y > 271 && y < 315))
-      {
-        page = 1;
-        if (EEPROM.read(saveAlertThreshold) != alarmThreshold)
-        {
-          EEPROM.write(saveAlertThreshold, alarmThreshold);
-          EEPROM.commit(); // save to EEPROM to be retrieved at startup
-        }
-        drawSettingsPage();
-      }
-      else if ((x > 130 && x < 190) && (y > 70 && y < 120))
-      {
-        alarmThreshold++;
-        if (alarmThreshold > 100)
-          alarmThreshold = 100;
-      }
-      else if ((x > 130 && x < 190) && (y > 185 && y < 245))
-      {
-        alarmThreshold--;
-        if (alarmThreshold <= 2)
-          alarmThreshold = 2;
-      }
-    }
-  }
-  else if (page == 4)     // calibration page
-  {
-    tft.setFont();
-    tft.setTextSize(3);
-    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setCursor(161, 146);
-    tft.println(conversionFactor);
-    if (conversionFactor < 100)
-      tft.fillRect(197, 146, 22, 22, ILI9341_BLACK);
-
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
-
-      if ((x > 4 && x < 62) && (y > 271 && y < 315))
-      {
-        page = 1;
-        if (EEPROM.read(saveCalibration) != conversionFactor)
-        {
-          EEPROM.write(saveCalibration, conversionFactor);
-          EEPROM.commit();
-        }
-        drawSettingsPage();
-      }
-      else if ((x > 160 && x < 220) && (y > 70 && y < 120))
-      {
-        conversionFactor++;
-      }
-      else if ((x > 160 && x < 220) && (y > 185 && y < 245))
-      {
-        conversionFactor--;
-        if (conversionFactor <= 1)
-          conversionFactor = 1;
-      }
-    }
-  }
-  else if (page == 5)  // Wifi page
-  {
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
-
-      if ((x > 4 && x < 62) && (y > 271 && y < 315))
-      {
-        page = 1;
-        if (EEPROM.read(saveLoggingMode) != isLogging) // check current EEPROM value and only write if new value is different
-        {
-          EEPROM.write(saveLoggingMode, isLogging); 
-          EEPROM.commit();
-        }
-        drawSettingsPage();
-      }
-      else if ((x > 3 && x < 237) && (y > 64 && y < 108))  // wifi setup button
-      {
-        tft.setFont(&FreeSans9pt7b);
+        tft.fillRoundRect(3, 107, 234, 16, 4, sc);
         tft.setTextSize(1);
+        tft.setTextColor(C_BLACK, sc);
+        int sw = textW(st, 1);
+        tft.setCursor(3 + (234 - sw) / 2, 111);
+        tft.print(st);
 
-        tft.fillRoundRect(10, 30, 220, 260, 6, ILI9341_BLACK);
-        tft.drawRoundRect(10, 30, 220, 260, 6, ILI9341_WHITE);
-
-        tft.setCursor(50, 50);
-        tft.println("AP SETUP MODE");
-        tft.drawFastHLine(50, 53, 145, ILI9341_WHITE);
-        tft.setCursor(20, 80);
-        tft.println("With any WiFi capable");
-        tft.setCursor(20, 100);
-        tft.println("device, connect to");
-        tft.setCursor(20, 120);
-        tft.println("network \"GC20\" and ");
-        tft.setCursor(20, 140);
-        tft.println("browse to 192.168.4.1");
-        tft.setCursor(20, 160);
-        tft.println("Enter credentials");
-        tft.setCursor(20, 180);
-        tft.println("of your WiFi network");
-        tft.setCursor(20, 200);
-        tft.println("and the Channel ID and");
-        tft.setCursor(20, 220);
-        tft.println("write API key of your");
-        tft.setCursor(20, 240);
-        tft.println("ThingSpeak channel");
-
-        delay(100);
-        WiFiManager wifiManager;
-
-        char channelIDSt[20];
-        char writeAPISt[20];
-
-        WiFiManagerParameter channel_id("0", "Channel ID", channelIDSt, 20); // create custom parameters for setup
-        
-        WiFiManagerParameter write_api("1", "Write API", writeAPISt, 20);
-        wifiManager.addParameter(&channel_id);
-        wifiManager.addParameter(&write_api);
-
-        wifiManager.startConfigPortal("GC20");            // put the esp in AP mode for wifi setup, create a network with name "GC20"
-
-        strcpy(channelIDSt, channel_id.getValue());
-        strcpy(writeAPISt, write_api.getValue());
-
-        size_t idLen = String(channelIDSt).length();
-
-        size_t apiLen = String(writeAPISt).length();
-
-        char channelInit = EEPROM.read(4001);  // first character of channelID is stored in EEPROM address 4001
-        char apiKeyInit = EEPROM.read(4002);   // Only overwrite channelIDSt and writeAPISt if new value of the first character is different from what was saved.
-
-        if (channelInit != channelIDSt[0])   
-        {
-          for (unsigned int a = 50; a < 50 + idLen; a++)
-          {
-            EEPROM.write((a), channelIDSt[a - 50]);
-          }
-          EEPROM.write(saveIDLen, idLen);
-        }
-
-        if(apiKeyInit != writeAPISt[0])
-        {
-          for (unsigned int b = 70; b < 70 + apiLen; b++)
-          {
-            EEPROM.write((b), writeAPISt[b - 70]);
-          }
-          EEPROM.write(saveAPILen, apiLen);
-        }
-
-        String ssidString = WiFi.SSID();      // retrieve ssid and password form the WifiManager library
-        String passwordString = WiFi.psk();
-
-        size_t ssidLen = ssidString.length();
-        size_t passLen = passwordString.length();
-
-        Serial.println(ssidLen);
-        Serial.println(passLen);
-
-        char ssidChar[20];
-        char passwordChar[20];
-
-        ssidString.toCharArray(ssidChar, ssidLen + 1); 
-        passwordString.toCharArray(passwordChar, passLen + 1);
-
-        for (unsigned int a = 10; a < 10 + ssidLen; a++)
-        {
-          EEPROM.write((a), ssidChar[a - 10]);             // save ssid and ssid length to EEPROM
-        }
-        EEPROM.write(saveSSIDLen, ssidLen);
-        
-        for (unsigned int b = 30; b < 30 + passLen; b++)
-        {    
-          EEPROM.write((b), passwordChar[b - 30]);          // save password and password length to EEPROM
-        }
-        EEPROM.write(savePWLen, passLen);
-
-        EEPROM.write(4001, channelIDSt[0]);                 // save first characters of channel ID and api key to EEPROM
-        EEPROM.write(4002, writeAPISt[0]);
-
-        EEPROM.commit();
-
-        tft.setCursor(16, 265);
-        tft.println("Settings saved. Restarting");
-
-        delay(1000);
-        
-        ESP.reset();
-      }
-      else if ((x > 3 && x < 237) && (y > 162 && y < 206)) // upload data
-      {
-        
-        drawBlankDialogueBox();
-        tft.setCursor(38, 100);
-        tft.println("Connecting to Wifi..");
-        delay(100);
-        Serial.println(ssid);
-        Serial.println(password);
-
-        WiFi.begin(ssid, password);
-
-        while (WiFi.status() != WL_CONNECTED) {    // Wait for the Wi-Fi to connect
-          delay(100);
-        }
-
-        tft.setCursor(36, 160);
-        tft.println("Creating JSON file..");
-        createJsonFile();                         // reads logged data from EEPROM and creates a json file
-        Serial.println(jsonBuffer);
-        delay(1000);
-        tft.setCursor(70, 220);
-        tft.println("Uploading..");
-        delay(1000);
-
-        char secondHalf[50] = "\",\"updates\":";      
-        strcat(data, channelAPIkey);
-        strcat(data, secondHalf);               
-
-        strcat(data,jsonBuffer);                // concatenate strings together and store in array named data
-        strcat(data,"}");
-
-        Serial.println(data);
-
-        client.stop();
-        String data_length = String(strlen(data)+1);   
-        
-        if (client.connect(server, 80)) {          // post data to thingspeak
-          char temp1[100] = "POST /channels/";
-          char temp2[30] = "/bulk_update.json HTTP/1.1";
-          
-          strcat(temp1, channelID);
-          strcat(temp1, temp2);
-
-          client.println(temp1); 
-          client.println("Host: api.thingspeak.com");
-          client.println("User-Agent: mw.doc.bulk-update (Arduino ESP8266)");
-          client.println("Connection: close");
-          client.println("Content-Type: application/json");
-          client.println("Content-Length: "+data_length);
-          client.println();
-          client.println(data);
-          client.stop();
-          
-          WiFi.disconnect();
-          WiFi.mode( WIFI_OFF );                // turn off wifi
-          WiFi.forceSleepBegin();
-          delay(1);
-
-          clearLogs();                 // erase logs and re-initialize the json buffer
-          tft.setCursor(43, 260);
-          tft.println("Resetting Device..");
-          delay(1000);
-          ESP.reset();                 
-        }
-        else 
-        {
-          tft.setCursor(50, 260);
-          tft.println("Failed to upload");
-          delay(1000);
-          ESP.reset();
-        }
-        
-      }
-      else if ((x > 3 && x < 237) && (y > 114 && y < 158)) // logging 
-      {
-        isLogging = !isLogging;
-        if (isLogging)
-        {
-          tft.fillRoundRect(3, 114, 234, 44, 4, 0x3B8F);
-          tft.drawRoundRect(3, 114, 234, 44, 4, WHITE);
-          tft.setCursor(38, 145);
-          tft.println("LOGGING ON");
-        }
-        else
-        {
-          tft.fillRoundRect(3, 114, 234, 44, 4, 0xB9C7);
-          tft.drawRoundRect(3, 114, 234, 44, 4, WHITE);
-          tft.setCursor(33, 145);
-          tft.println("LOGGING OFF");
-        }
-      }
-      else if ((x > 3 && x < 237) && (y > 214 && y < 258))  // device mode
-      {
-        page = 8;
-        drawDeviceModePage();
-      }
+        prevDoseLevel = doseLevel;
+        strcpy(lastDoseStr, ""); // force dose redraw
     }
-  }
-  else if (page == 6) // timed count setup page
-  {
-    if (interval < 10)
-    {
-      intervalSize = 1;
+
+    // Dose number — unpadded, centered; setTextColor bg fills old pixels
+    char d[8];
+    formatDose(d, doseRate);
+
+    if (strcmp(d, lastDoseStr) != 0) {
+        tft.setTextSize(4);
+        tft.setTextColor(C_WHITE, cardBg);
+        int dw = textW(d, 4);
+        tft.setCursor(3 + (234 - dw) / 2, 38);
+        tft.print(d);
+        strcpy(lastDoseStr, d);
     }
-    else if (interval < 100)
-    {
-      intervalSize = 2;
+
+    // Stats row — fixed-width, print() overwrites without clearing
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_BG);
+    tft.setCursor(5, 132);  tft.print("CPM:");
+
+    char cpmF[8]; sprintf(cpmF, "%5u", (int)avgCPM);
+    tft.setTextColor(C_ACCENT2, C_BG);
+    tft.setCursor(36, 132); tft.print(cpmF);
+
+    if (uncertaintyCPM >= 1.0f && integrationMode != 0) {
+        tft.setTextColor(C_DIM, C_BG);
+        tft.setCursor(72, 132);  tft.print("+/-");
+        char uf[6]; sprintf(uf, "%3u", (int)uncertaintyCPM);
+        tft.setCursor(96, 132);  tft.print(uf);
     }
-    else 
-    {
-      intervalSize = 3;
+
+    char tf[20]; sprintf(tf, "Total:%7lu", totalPulseCount);
+    tft.setTextColor(C_WHITE, C_BG);
+    int tw = textW(tf, 1);
+    tft.setCursor(234 - tw, 132); tft.print(tf);
+
+    // Trend graph
+    redrawTrendGraph();
+
+    // Battery
+    if (batUpdateCtr == 0) drawBattery(210, 4);
+}
+
+// ============================================================================
+// TREND GRAPH
+// ============================================================================
+void redrawTrendGraph() {
+    const int GX = 3, GY = 148, GW = 234, GH = 64;
+    const int TITLE_H = 10;  // title row height, not cleared each frame
+
+    // Clear only the bar area, leave title + border intact
+    tft.fillRect(GX + 1, GY + TITLE_H, GW - 2, GH - TITLE_H - 1, C_CARD_BG);
+
+    // Title row
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_CARD_BG);
+    tft.setCursor(GX + 4, GY + 1);
+    tft.print("CPM TREND");
+
+    // Max label
+    uint16_t maxV = 20;
+    for (uint8_t i = 0; i < 60; i++) if (cpmRing[i] > maxV) maxV = cpmRing[i];
+    if (maxV < 20) maxV = 20;
+    if (maxV <= 100) maxV = ((maxV + 9) / 10) * 10;
+    else if (maxV <= 500) maxV = ((maxV + 24) / 25) * 25;
+    else maxV = ((maxV + 49) / 50) * 50;
+    tft.setCursor(GX + GW - 35, GY + 1);
+    tft.print(maxV);
+
+    // Bars
+    int pX = GX + 3, pW = GW - 6, pB = GY + GH - 2, pH = GH - TITLE_H - 2;
+    float bw = (float)pW / 60.0f;
+
+    for (uint8_t i = 0; i < 60; i++) {
+        uint8_t idx = (ringIndex + i) % 60;
+        uint16_t v = cpmRing[idx];
+        int bh = (int)((float)v / (float)maxV * (float)pH);
+        if (bh < 1 && v > 0) bh = 1;
+        if (bh > pH) bh = pH;
+        int bx = pX + (int)(i * bw);
+        int bwi = (int)((i + 1) * bw) - (int)(i * bw);
+        if (bwi < 1) bwi = 1;
+
+        float bd = calcDoseRate((float)v);
+        uint16_t bc = (bd >= alarmThreshold) ? C_RED : (bd >= 0.5f) ? C_YELLOW : C_GREEN;
+        if (bh > 0) tft.fillRect(bx, pB - bh, bwi, bh, bc);
     }
-    
-    tft.setFont();
+}
+
+// ============================================================================
+// TOOLBAR REDRAW
+// ============================================================================
+void redrawToolbar() {
+    tft.fillRect(0, 213, 240, 107, C_BG);
+
+    const char* modeLbl;
+    switch (integrationMode) {
+        case 0: modeLbl = "10s"; break;
+        case 1: modeLbl = "60s"; break;
+        case 2: modeLbl = "5m"; break;
+        default: modeLbl = "60s"; break;
+    }
+
+    // Row 1 — y=233 h=46
+    tft.fillRoundRect(3, 233, 74, 46, 5, C_BTN_BG);
+    tft.drawRoundRect(3, 233, 74, 46, 5, C_ACCENT);
+    tft.drawBitmap(3 + (74 - 16) / 2, 233 + (46 - 16) / 2,
+                  menuIcon, 16, 16, C_WHITE);
+
+    tft.fillRoundRect(83, 233, 74, 46, 5, C_BTN_BG);
+    tft.drawRoundRect(83, 233, 74, 46, 5, C_ACCENT);
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_BTN_BG);
+    tft.setCursor(83 + (74 - textW(modeLbl, 2)) / 2, 248);
+    tft.print(modeLbl);
+
+    tft.fillRoundRect(163, 233, 73, 46, 5, C_BTN_BG);
+    tft.drawRoundRect(163, 233, 73, 46, 5, C_ACCENT);
+    tft.drawBitmap(163 + (73 - 16) / 2, 233 + (46 - 16) / 2,
+                  timedIcon, 16, 16, C_WHITE);
+
+    // Row 2 — y=283 h=32
+    uint16_t buzBg = buzzerEnabled ? C_BTN_ON : C_BTN_OFF;
+    tft.fillRoundRect(3, 283, 112, 32, 4, buzBg);
+    tft.drawRoundRect(3, 283, 112, 32, 4, C_DIM);
+    tft.drawBitmap(3 + (112 - 24) / 2, 283 + (32 - 16) / 2,
+                  buzzerEnabled ? speakerOn : speakerOff, 24, 16, C_WHITE);
+
+    uint16_t ledBg = ledEnabled ? C_BTN_ON : C_BTN_OFF;
+    tft.fillRoundRect(125, 283, 112, 32, 4, ledBg);
+    tft.drawRoundRect(125, 283, 112, 32, 4, C_DIM);
+    if (ledEnabled) {
+        tft.drawBitmap(125 + (112 - 16) / 2, 283 + (32 - 16) / 2,
+                      ledOnIcon, 16, 16, C_WHITE);
+    } else {
+        tft.drawBitmap(125 + (112 - 8) / 2, 283 + (32 - 14) / 2,
+                      ledOffIcon, 8, 14, C_WHITE);
+    }
+}
+
+// ============================================================================
+// PAGE 1 — SETTINGS MENU
+// ============================================================================
+void drawSettingsMenu() {
+    drawFrame("SETTINGS");
+    drawBackButton();
+
+    const char* items[] = {
+        "Dose Units", "Alarm Threshold", "Calibration",
+        "Calibration Guide", "About Device"
+    };
+    for (uint8_t i = 0; i < 5; i++) {
+        int by = 36 + i * 46;
+        tft.fillRoundRect(6, by, 228, 40, 5, C_CARD_BG);
+        tft.drawRoundRect(6, by, 228, 40, 5, C_ACCENT);
+        tft.setTextSize(2);
+        tft.setTextColor(C_WHITE, C_CARD_BG);
+        tft.setCursor(16, by + 12);
+        tft.print(items[i]);
+        tft.setTextColor(C_ACCENT2, C_CARD_BG);
+        tft.setCursor(215, by + 12);
+        tft.print(">");
+    }
+}
+
+void handlePage1() {
+    if (!readTouch()) return;
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) {
+        page = 0; dashboardBuilt = false; prevDoseLevel = 255;
+        strcpy(lastDoseStr, ""); drawDashboard(); dashboardBuilt = true;
+        return;
+    }
+    for (uint8_t i = 0; i < 5; i++) {
+        int by = 36 + i * 46;
+        if (touchX >= 6 && touchX <= 234 && touchY >= by && touchY <= by + 40) {
+            switch (i) {
+                case 0: page = 2; drawUnitsPage(); break;
+                case 1: page = 3; drawAlertPage(); break;
+                case 2: page = 4; drawCalibrationPage(); break;
+                case 3: page = 5; drawCalibrationGuide(); break;
+                case 4: page = 8; drawAboutPage(); break;
+            }
+            return;
+        }
+    }
+}
+
+// ============================================================================
+// PAGE 2 — DOSE UNITS
+// ============================================================================
+void drawUnitsPage() {
+    drawFrame("DOSE UNITS");
+    drawBackButton();
+
+    // uSv/h button
+    bool isSv = (doseUnits == 0);
+    uint16_t bg0 = isSv ? C_BTN_ON : C_BTN_DIM;
+    uint16_t brd0 = isSv ? C_GREEN : C_DIM;
+    tft.fillRoundRect(30, 60, 180, 50, 6, bg0);
+    tft.drawRoundRect(30, 60, 180, 50, 6, brd0);
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, bg0);
+    tft.setCursor(30 + (180 - textW("uSv/h", 2)) / 2, 78);
+    tft.print("uSv/h");
+
+    // mR/h button
+    uint16_t bg1 = (!isSv) ? C_BTN_ON : C_BTN_DIM;
+    uint16_t brd1 = (!isSv) ? C_GREEN : C_DIM;
+    tft.fillRoundRect(30, 130, 180, 50, 6, bg1);
+    tft.drawRoundRect(30, 130, 180, 50, 6, brd1);
+    tft.setCursor(30 + (180 - textW("mR/h", 2)) / 2, 148);
+    tft.print("mR/h");
+
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_BG);
+    const char* info = "1 mR/h = 10 uSv/h";
+    tft.setCursor((240 - textW(info, 1)) / 2, 220);
+    tft.print(info);
+}
+
+void handlePage2() {
+    if (!readTouch()) return;
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) {
+        saveSettings(); page = 1; drawSettingsMenu(); return;
+    }
+    if (touchX >= 30 && touchX <= 210 && touchY >= 60 && touchY <= 110) {
+        doseUnits = 0; drawUnitsPage(); return;
+    }
+    if (touchX >= 30 && touchX <= 210 && touchY >= 130 && touchY <= 180) {
+        doseUnits = 1; drawUnitsPage(); return;
+    }
+}
+
+// ============================================================================
+// PAGE 3 — ALARM THRESHOLD
+// ============================================================================
+void drawAlertPage() {
+    drawFrame("ALARM THRESHOLD");
+    drawBackButton();
+
+    uint16_t brd = (alarmThreshold >= 20) ? C_RED : C_ACCENT;
+    tft.fillRoundRect(45, 50, 150, 50, 6, C_CARD_BG);
+    tft.drawRoundRect(45, 50, 150, 50, 6, brd);
     tft.setTextSize(3);
-    tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-    tft.setCursor((185 - (intervalSize - 1) * 11), 146);
-    tft.println(interval);
+    tft.setTextColor(alarmThreshold >= 20 ? C_RED : C_WHITE, C_CARD_BG);
+    char buf[8]; sprintf(buf, "%u", alarmThreshold);
+    tft.setCursor(45 + (150 - textW(buf, 3)) / 2, 64);
+    tft.print(buf);
 
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
+    // - button — red
+    tft.fillRoundRect(30, 125, 75, 50, 6, C_RED);
+    tft.drawRoundRect(30, 125, 75, 50, 6, C_WHITE);
+    tft.setTextSize(3);
+    tft.setTextColor(C_WHITE, C_RED);
+    tft.setCursor(30 + (75 - textW("-", 3)) / 2, 139);
+    tft.print("-");
 
-      if ((x > 4 && x < 62) && (y > 271 && y < 315))
-      {
-        page = 0;
-        drawHomePage();
-        currentCount = 0;
-        previousCount = 0;
-        for (int a = 0; a < 60; a++)
-        {
-          count[a] = 0; // counts need to be reset to prevent errorenous readings
-        }
-        for (int b = 0; b < 5; b++)
-        {
-          fastCount[b] = 0;
-        }
-        for (int c = 0; c < 180; c++)
-        {
-          slowCount[c] = 0;
-        }
-      }
-      else if ((x > 145 && x < 235) && (y > 271 && y < 315))
-      {
-        page = 7;
-        drawTimedCountRunningPage(interval, intervalSize);
-      }
-      else if ((x > 160 && x < 220) && (y > 70 && y < 120))
-      {
-        interval += 5;
-        if (interval >= 995)
-        {
-          interval = 995;
-        }
-        tft.fillRect(160, 130, 70, 40, ILI9341_BLACK);
-      }
-      else if ((x > 160 && x < 220) && (y > 185 && y < 245))
-      {
-        interval -= 5;
-        if (interval <= 5)
-        {
-          interval = 5;
-        }
-        tft.fillRect(160, 130, 70, 40, ILI9341_BLACK);
-      }
+    // + button — green
+    tft.fillRoundRect(135, 125, 75, 50, 6, C_GREEN);
+    tft.drawRoundRect(135, 125, 75, 50, 6, C_WHITE);
+    tft.setCursor(135 + (75 - textW("+", 3)) / 2, 139);
+    tft.print("+");
+
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_BG);
+    const char* info1 = "Alarm triggers above threshold";
+    const char* info2 = "Range: 2 - 100";
+    tft.setCursor((240 - textW(info1, 1)) / 2, 210);
+    tft.print(info1);
+    tft.setCursor((240 - textW(info2, 1)) / 2, 224);
+    tft.print(info2);
+}
+
+void handlePage3() {
+    if (!readTouch()) return;
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) {
+        saveSettings(); page = 1; drawSettingsMenu(); return;
     }
-  }
-  else if (page == 7) // timed count running page
-  {
-    elapsedTime = millis() - startMillis;
-    if(elapsedTime < intervalMillis)
-    {
-      if((millis() - previousMillis) >= 1000)
-      {
-        previousMillis = millis();
-
-        tft.setFont();
-        tft.setTextSize(3);
-        tft.setTextColor(ILI9341_WHITE, ILI9341_BLACK);
-        tft.setCursor(101, 181);
-        tft.println(currentCount);
-
-        cpm = float(currentCount) / float((1 + elapsedTime) / 60000.0);
-        
-        tft.setCursor(101, 226);
-        tft.println(cpm);
-
-        if(cpm < 10)
-        {
-          tft.fillRect(170, 225, 50, 40, ILI9341_BLACK);
-        }
-        else if(cpm < 100)
-        {
-          tft.fillRect(190, 225, 35, 40, ILI9341_BLACK);
-        }
-        else if(cpm < 1000)
-        {
-          tft.fillRect(209, 225, 18, 40, ILI9341_BLACK);
-        }
-      }
-      progress = map(elapsedTime, 0, intervalMillis, 0, 217);
-      tft.fillRect(12, 105, progress, 16, 0x25A6);
+    if (touchX >= 30 && touchX <= 105 && touchY >= 125 && touchY <= 175) {
+        if (alarmThreshold > 2) { alarmThreshold--; drawAlertPage(); } return;
     }
-    else 
-    {
-      if (completed == 0)
-      {
-        drawCloseButton();
-        completed = 1;
-      }
+    if (touchX >= 135 && touchX <= 210 && touchY >= 125 && touchY <= 175) {
+        if (alarmThreshold < 100) { alarmThreshold++; drawAlertPage(); } return;
     }
-    
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
+}
 
-      if ((x > 70 && x < 170) && (y > 271 && y < 315))
-      {
-        page = 0;
-        drawHomePage();
-        currentCount = 0;
-        previousCount = 0;
-        for (int a = 0; a < 60; a++)
-        {
-          count[a] = 0; // counts need to be reset to prevent errorenous readings
+// ============================================================================
+// PAGE 4 — CALIBRATION
+// ============================================================================
+void drawCalibrationPage() {
+    drawFrame("CALIBRATION");
+    drawBackButton();
+
+    const char* names[] = {"Tube Sensitivity", "Dead Time", "Background CPM"};
+    uint16_t vals[] = {tubeSensitivity, deadTime, backgroundCPM};
+    const char* units[] = {"CPM/uSv/h", "us", "CPM"};
+
+    for (uint8_t i = 0; i < 3; i++) {
+        int py = 35 + i * 50;
+        bool sel = (i == selectedCalParam);
+        uint16_t bg = sel ? C_BTN_ON : C_CARD_BG;
+        uint16_t brd = sel ? C_ACCENT2 : C_ACCENT;
+
+        tft.fillRoundRect(6, py, 228, 44, 5, bg);
+        tft.drawRoundRect(6, py, 228, 44, 5, brd);
+
+        // Selection indicator
+        tft.setTextSize(2);
+        tft.setTextColor(sel ? C_WHITE : C_DIM, bg);
+        tft.setCursor(12, py + 13);
+        tft.print(sel ? ">" : " ");
+
+        // Parameter name
+        tft.setTextSize(1);
+        tft.setCursor(28, py + 8);
+        tft.print(names[i]);
+
+        // Value
+        tft.setTextSize(1);
+        tft.setTextColor(C_WHITE, bg);
+        char vbuf[20];
+        sprintf(vbuf, "%u %s", vals[i], units[i]);
+        int vw = textW(vbuf, 1);
+        tft.setCursor(228 - vw - 6, py + 8);
+        tft.print(vbuf);
+
+        // Sub-label
+        tft.setTextColor(C_DIM, bg);
+        tft.setCursor(28, py + 28);
+        switch (i) {
+            case 0: tft.print("Conversion slope"); break;
+            case 1: tft.print("Dead time correction"); break;
+            case 2: tft.print("Subtracted from readings"); break;
         }
-        for (int b = 0; b < 5; b++)
-        {
-          fastCount[b] = 0;
-        }
-        for (int c = 0; c < 180; c++)
-        {
-          slowCount[c] = 0;
-        }
-      }
     }
-  }
-  else if (page == 8)          // device mode selection page
-  {
-    if (!ts.touched())
-      wasTouched = 0;
-    if (ts.touched() && !wasTouched)
-    {
-      wasTouched = 1;
-      TS_Point p = ts.getPoint();
-      x = map(p.x, TS_MINX, TS_MAXX, 240, 0);
-      y = map(p.y, TS_MINY, TS_MAXY, 320, 0);
 
-      if ((x > 4 && x < 62) && (y > 271 && y < 315)) // back button
-      {
-        page = 5;
-        if (EEPROM.read(saveDeviceMode) != deviceMode) // check current EEPROM value and only write if new value is different
-        {
-          EEPROM.write(saveDeviceMode, deviceMode); 
-          EEPROM.commit();
-        }
-        drawWifiPage();
-      }
-      else if ((x > 4 && x < 234) && (y > 70 && y < 120))
-      {
-        deviceMode = 0;
-        tft.setFont(&FreeSans12pt7b);
-        tft.fillRoundRect(4, 71, 232, 48, 4, 0x2A86);
-        tft.setCursor(13, 103);
-        tft.println("GEIGER COUNTER");
+    // Adjustment controls — no label, just - / value / +
+    int aY = 195;
+    // - button red
+    tft.fillRoundRect(35, aY, 50, 34, 5, C_RED);
+    tft.drawRoundRect(35, aY, 50, 34, 5, C_WHITE);
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_RED);
+    tft.setCursor(35 + (50 - textW("-", 2)) / 2, aY + 10);
+    tft.print("-");
 
-        tft.fillRoundRect(4, 128, 232, 48, 4, ILI9341_BLACK);
-        tft.setCursor(30, 160);
-        tft.println("MON. STATION");
-
-      }
-      else if ((x > 4 && x < 234) && (y > 127 && y < 177))
-      {
-        deviceMode = 1;
-        tft.setFont(&FreeSans12pt7b);
-        tft.fillRoundRect(4, 71, 232, 48, 4, ILI9341_BLACK);
-        tft.setCursor(13, 103);
-        tft.println("GEIGER COUNTER");
-
-        tft.fillRoundRect(4, 128, 232, 48, 4, 0x2A86);
-        tft.setCursor(30, 160);
-        tft.println("MON. STATION");
-
-      }
+    // Current value
+    char aval[12];
+    switch (selectedCalParam) {
+        case 0: sprintf(aval, "%u", tubeSensitivity); break;
+        case 1: sprintf(aval, "%u us", deadTime); break;
+        case 2: sprintf(aval, "%u", backgroundCPM); break;
     }
-  }
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_BG);
+    tft.setCursor(95 + (50 - textW(aval, 2)) / 2, aY + 10);
+    tft.print(aval);
+
+    // + button green
+    tft.fillRoundRect(155, aY, 50, 34, 5, C_GREEN);
+    tft.drawRoundRect(155, aY, 50, 34, 5, C_WHITE);
+    tft.setCursor(155 + (50 - textW("+", 2)) / 2, aY + 10);
+    tft.print("+");
+
+    // Cal guide button
+    tft.fillRoundRect(35, 248, 170, 26, 5, C_BTN_BG);
+    tft.drawRoundRect(35, 248, 170, 26, 5, C_ACCENT);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_BTN_BG);
+    const char* gl = "CALIBRATION GUIDE";
+    tft.setCursor(35 + (170 - textW(gl, 1)) / 2, 267);
+    tft.print(gl);
 }
 
-void drawHomePage()
-{
-
-  tft.fillRect(1, 21, 237, 298, ILI9341_BLACK);
-  tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_WHITE);
-
-  tft.drawRoundRect(210, 4, 26, 14, 3, ILI9341_WHITE);
-  tft.drawLine(209, 8, 209, 13, ILI9341_WHITE); // Battery symbol
-  tft.drawLine(208, 8, 208, 13, ILI9341_WHITE);
-  tft.fillRect(212, 6, 22, 10, ILI9341_BLACK);
-
-  tft.fillRect(batteryMapped, 6, (234 - batteryMapped), 10, ILI9341_GREEN);
-  
-  tft.setTextSize(1);
-  tft.setTextColor(ILI9341_CYAN);
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(2, 16);
-  tft.println("GC-20");
-  tft.setTextColor(ILI9341_WHITE);
-  
-  tft.setFont();
-  tft.setTextSize(2);
-  tft.setCursor(118, 4);
-  tft.println("+");
-  tft.setTextSize(1);
-  tft.setFont(&FreeSans9pt7b);
-
-  tft.drawBitmap(103, 2, betaBitmap, 18, 18, ILI9341_WHITE);
-  tft.drawBitmap(128, 2, gammaBitmap, 12, 18, ILI9341_WHITE);
-
-  tft.drawLine(1, 20, 238, 20, ILI9341_WHITE);
-  tft.fillRoundRect(3, 23, 234, 69, 3, DOSEBACKGROUND);
-  tft.setCursor(16, 40);
-  tft.println("EFFECTIVE DOSE RATE:");
-  tft.setCursor(165, 85);
-  tft.setFont(&FreeSans12pt7b);
-  if (doseUnits == 0)
-  {
-    tft.println("uSv/hr");
-  }
-  else if (doseUnits == 1)
-  {
-    tft.println("mR/hr");
-  }
-
-  tft.fillRoundRect(3, 94, 234, 21, 3, 0x2DC6);
-  tft.setCursor(15, 110);
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextColor(ILI9341_WHITE);
-  tft.setTextSize(1);
-  tft.println("NORMAL BACKGROUND");
-
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(7, 141);
-  tft.println("CPM:");
-  tft.drawRoundRect(3, 117, 234, 32, 3, DOSEBACKGROUND);
-
-  tft.fillRoundRect(3, 151, 185, 105, 4, 0x630C);
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(9, 171);
-  tft.println("CUMULATIVE DOSE");
-  tft.setCursor(7, 205);
-  tft.println("Counts:");
-  if (doseUnits == 0)
-  {
-    tft.setCursor(34, 235);
-    tft.println("uSv:");
-  }
-  else if (doseUnits == 1)
-  {
-    tft.setCursor(37, 235);
-    tft.println("mR:");
-  }
-
-  tft.fillRoundRect(3, 259, 58, 57, 3, 0x3B8F);
-  tft.drawBitmap(1, 257, settingsBitmap, 60, 60, ILI9341_WHITE);
-
-  tft.fillRoundRect(64, 259, 95, 57, 3, 0x6269);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setTextSize(1);
-  tft.setCursor(74, 284);
-  tft.println("TIMED");
-  tft.setCursor(70, 309);
-  tft.println("COUNT");
-
-  if (integrationMode == 0)
-  {
-    tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-    tft.setCursor(180, 283);
-    tft.println("INT");
-    tft.setCursor(177, 309);
-    tft.println("60 s");
-  }
-  else if (integrationMode == 1)
-  {
-    tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-    tft.setCursor(180, 283);
-    tft.println("INT");
-    tft.setCursor(184, 309);
-    tft.println("5 s");
-  }
-  else if (integrationMode == 2)
-  {
-    tft.fillRoundRect(162, 259, 74, 57, 3, 0x2A86);
-    tft.setCursor(180, 283);
-    tft.println("INT");
-    tft.setCursor(169, 309);
-    tft.println("180 s");
-  }
-
-  if (ledSwitch)
-  {
-    tft.fillRoundRect(190, 151, 46, 51, 3, 0x6269);
-    tft.drawBitmap(190, 153, ledOnBitmap, 45, 45, ILI9341_WHITE);
-  }
-  else if (!ledSwitch)
-  {
-    tft.fillRoundRect(190, 151, 46, 51, 3, 0x6269);
-    tft.drawBitmap(190, 153, ledOffBitmap, 45, 45, ILI9341_WHITE);
-  }
-  if (buzzerSwitch)
-  {
-    tft.fillRoundRect(190, 205, 46, 51, 3, 0x6269);
-    tft.drawBitmap(190, 208, buzzerOnBitmap, 45, 45, ILI9341_WHITE);
-  }
-  else if (!buzzerSwitch)
-  {
-    tft.fillRoundRect(190, 205, 46, 51, 3, 0x6269);
-    tft.drawBitmap(190, 208, buzzerOffBitmap, 45, 45, ILI9341_WHITE);
-  }
-  tft.setFont(&FreeSans9pt7b);
-  if (isLogging)
-  {
-    tft.setCursor(175, 16);
-    tft.println("L");
-  }
-  else
-  {
-    tft.fillRect(175, 2, 18, 18, ILI9341_BLACK);
-  }
-  
-  if (deviceMode)
-  {
-    tft.drawBitmap(188, 1, wifiBitmap, 19, 19, ILI9341_WHITE);
-  }
-  else
-  {
-    tft.fillRect(188, 1, 19, 19, ILI9341_BLACK);
-  }
+void handlePage4() {
+    if (!readTouch()) return;
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) {
+        saveSettings(); page = 1; drawSettingsMenu(); return;
+    }
+    for (uint8_t i = 0; i < 3; i++) {
+        int py = 35 + i * 50;
+        if (touchX >= 6 && touchX <= 234 && touchY >= py && touchY <= py + 44) {
+            if (selectedCalParam != i) { selectedCalParam = i; drawCalibrationPage(); }
+            return;
+        }
+    }
+    if (touchX >= 35 && touchX <= 85 && touchY >= 195 && touchY <= 229) {
+        switch (selectedCalParam) {
+            case 0: if (tubeSensitivity > 1) tubeSensitivity--; break;
+            case 1: if (deadTime > 10) deadTime -= 10; break;
+            case 2: if (backgroundCPM > 0) backgroundCPM--; break;
+        }
+        drawCalibrationPage(); return;
+    }
+    if (touchX >= 155 && touchX <= 205 && touchY >= 195 && touchY <= 229) {
+        switch (selectedCalParam) {
+            case 0: if (tubeSensitivity < 999) tubeSensitivity++; break;
+            case 1: if (deadTime < 2000) deadTime += 10; break;
+            case 2: if (backgroundCPM < 500) backgroundCPM++; break;
+        }
+        drawCalibrationPage(); return;
+    }
+    if (touchX >= 35 && touchX <= 205 && touchY >= 248 && touchY <= 274) {
+        calGuidePg = 0; page = 5; drawCalibrationGuide(); return;
+    }
 }
 
-void drawSettingsPage()
-{
-  digitalWrite(D3, LOW);
-  digitalWrite(D0, LOW);
+// ============================================================================
+// PAGE 5 — CALIBRATION GUIDE
+// ============================================================================
+void drawCalibrationGuide() {
+    drawFrame("CALIBRATION GUIDE");
+    drawBackButton();
 
-  drawFrame();
+    tft.setTextSize(1);
+    const char* linesP0[] = {
+        "HOW TO CALIBRATE YOUR GC-20","",
+        "1. SET BACKGROUND CPM:","Place outdoors, away from buildings.",
+        "Run SLOW 5m mode 5-10 min. Note","stable CPM and enter as Background.","",
+        "2. SET DEAD TIME:","SBM-20 default: 190us. Only change",
+        "for different tubes.","SBM-19=200us, SI-29BG=150us."
+    };
+    const char* linesP1[] = {
+        "3. SET TUBE SENSITIVITY:","Most important! Use a reference",
+        "source or calibrated instrument.","",
+        "Method A - Check source:","Place near known source (e.g.Cs-137).",
+        "Adjust Sensitivity until dose","matches expected value.","",
+        "Method B - Reference device:","Compare with calibrated Geiger",
+        "counter at 2-3 dose rates.","",
+        "Method C - Default:","SBM-20: 175 CPM/uSv/h for Cs-137.",
+        "Gives +/-20% without calibration.","",
+        "IMPORTANT: Higher Sensitivity =",
+        "LOWER displayed dose. If reading","too high, INCREASE sensitivity."
+    };
 
-  tft.fillRoundRect(3, 23, 234, 35, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(57, 48);
-  tft.println("SETTINGS");
-  tft.drawFastHLine(59, 51, 117, WHITE);
+    const char** lines = (calGuidePg == 0) ? linesP0 : linesP1;
+    uint8_t n = (calGuidePg == 0) ? sizeof(linesP0)/sizeof(linesP0[0])
+                                  : sizeof(linesP1)/sizeof(linesP1[0]);
+    int yPos = 34;
+    for (uint8_t i = 0; i < n && yPos < 268; i++) {
+        if (strlen(lines[i]) == 0) { yPos += 4; continue; }
+        tft.setCursor(6, yPos);
+        if (lines[i][0] >= '1' && lines[i][0] <= '3' && lines[i][1] == '.')
+            tft.setTextColor(C_ACCENT2, C_BG);
+        else if (strncmp(lines[i], "Method", 6) == 0)
+            tft.setTextColor(C_YELLOW, C_BG);
+        else if (strncmp(lines[i], "IMPORTANT", 9) == 0)
+            tft.setTextColor(C_RED, C_BG);
+        else
+            tft.setTextColor(C_WHITE, C_BG);
+        tft.print(lines[i]);
+        yPos += 12;
+    }
 
-  tft.fillRoundRect(3, 64, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 64, 234, 44, 4, WHITE);
-  tft.setCursor(44, 94);
-  tft.println("DOSE UNITS");
+    // Page indicator
+    char pi[8]; sprintf(pi, "%u/2", calGuidePg + 1);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.setCursor((240 - textW(pi, 1)) / 2, 278);
+    tft.print(pi);
 
-  tft.fillRoundRect(3, 114, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 114, 234, 44, 4, WHITE);
-  tft.setCursor(5, 145);
-  tft.println("ALERT THRESHOLD");
-
-  tft.fillRoundRect(3, 164, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 164, 234, 44, 4, WHITE);
-  tft.setCursor(37, 194);
-  tft.println("CALIBRATION");
-
-  tft.fillRoundRect(3, 214, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 214, 234, 44, 4, WHITE);
-  tft.setCursor(8, 244);
-  tft.println("LOGGING AND WIFI");
-
-  drawBackButton();
+    // Prev / Next buttons
+    if (calGuidePg > 0) {
+        tft.fillRoundRect(50, 284, 60, 28, 4, C_BTN_BG);
+        tft.drawRoundRect(50, 284, 60, 28, 4, C_ACCENT);
+        tft.setCursor(50 + (60 - textW("PREV", 1)) / 2, 296);
+        tft.print("PREV");
+    }
+    if (calGuidePg < 1) {
+        tft.fillRoundRect(130, 284, 60, 28, 4, C_BTN_BG);
+        tft.drawRoundRect(130, 284, 60, 28, 4, C_ACCENT);
+        tft.setCursor(130 + (60 - textW("NEXT", 1)) / 2, 296);
+        tft.print("NEXT");
+    }
 }
 
-void drawUnitsPage()
-{
-  drawFrame();
-
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(84, 51);
-  tft.println("UNITS");
-  tft.drawFastHLine(86, 55, 71, WHITE);
-
-  drawBackButton();
-
-  tft.drawRoundRect(3, 70, 234, 50, 4, WHITE);
-  if (doseUnits == 0)
-    tft.fillRoundRect(4, 71, 232, 48, 4, 0x2A86);
-  tft.setCursor(30, 103);
-  tft.println("Sieverts (uSv/hr)");
-
-  tft.drawRoundRect(3, 127, 234, 50, 4, WHITE);
-  if (doseUnits == 1)
-    tft.fillRoundRect(4, 128, 232, 48, 4, 0x2A86);
-  tft.setCursor(47, 160);
-  tft.println("Rems (mR/hr)");
+void handlePage5() {
+    if (!readTouch()) return;
+    // Back button
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 312) {
+        calGuidePg = 0;
+        page = 4; drawCalibrationPage(); return;
+    }
+    // Prev
+    if (calGuidePg > 0 && touchX >= 50 && touchX <= 110 && touchY >= 284 && touchY <= 312) {
+        calGuidePg--; drawCalibrationGuide(); return;
+    }
+    // Next
+    if (calGuidePg < 1 && touchX >= 130 && touchX <= 190 && touchY >= 284 && touchY <= 312) {
+        calGuidePg++; drawCalibrationGuide(); return;
+    }
 }
 
-void drawAlertPage()
-{
-  drawFrame();
+// ============================================================================
+// PAGE 6 — TIMED COUNT SETUP
+// ============================================================================
+void drawTimedCountSetup() {
+    drawFrame("TIMED COUNT");
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_BG);
+    tft.setCursor(10, 40);
+    tft.print("Select duration:");
 
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(4, 51);
-  tft.println("ALERT THRESHOLD");
-  tft.drawFastHLine(5, 55, 229, WHITE);
+    const uint8_t ints[] = {1, 2, 5, 10, 30, 60};
+    for (uint8_t i = 0; i < 6; i++) {
+        int bx = (i % 3) * 78 + 6, by = 58 + (i / 3) * 50;
+        bool act = (timedInterval == ints[i]);
+        uint16_t bg = act ? C_BTN_ON : C_BTN_BG;
+        uint16_t brd = act ? C_ACCENT2 : C_ACCENT;
+        tft.fillRoundRect(bx, by, 72, 42, 5, bg);
+        tft.drawRoundRect(bx, by, 72, 42, 5, brd);
+        tft.setTextSize(2);
+        tft.setTextColor(C_WHITE, bg);
+        char lb[6]; sprintf(lb, "%u", ints[i]);
+        tft.setCursor(bx + 8, by + 12);
+        tft.print(lb);
+        tft.setTextSize(1);
+        tft.setCursor(bx + 8, by + 30);
+        tft.print(i < 5 ? "min" : "hour");
+    }
 
-  drawBackButton();
-  
-  tft.setCursor(30, 164);
-  tft.println("uSv/hr:");
+    tft.fillRoundRect(40, 175, 160, 40, 6, C_BTN_ON);
+    tft.drawRoundRect(40, 175, 160, 40, 6, C_GREEN);
+    tft.setTextSize(2);
+    tft.setTextColor(C_WHITE, C_BTN_ON);
+    tft.setCursor(40 + (160 - textW("START", 2)) / 2, 186);
+    tft.print("START");
 
-  tft.drawRoundRect(130, 70, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(131, 71, 58, 58, 4, 0x2A86);
-  tft.drawRoundRect(130, 185, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(131, 186, 58, 58, 4, 0x2A86);
-
-  tft.setCursor(140, 113);
-  tft.setTextSize(3);
-  tft.println("+");
-  tft.setCursor(148, 232);
-  tft.println("-");
-  tft.setTextSize(1);
+    tft.fillRoundRect(40, 228, 160, 32, 5, C_BTN_BG);
+    tft.drawRoundRect(40, 228, 160, 32, 5, C_ACCENT);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_BTN_BG);
+    tft.setCursor(40 + (160 - textW("CANCEL", 1)) / 2, 240);
+    tft.print("CANCEL");
 }
 
-void drawCalibrationPage()
-{
-  drawFrame();
-
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(47, 51);
-  tft.println("CALIBRATE");
-  tft.drawFastHLine(48, 55, 133, WHITE);
-
-  drawBackButton();
-
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(8, 154);
-  tft.println("Conversion Factor");
-  tft.setCursor(8, 174);
-  tft.println("(CPM per uSv/hr)");
-
-  tft.drawRoundRect(160, 70, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(161, 71, 58, 58, 4, 0x2A86);
-  tft.drawRoundRect(160, 185, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(161, 186, 58, 58, 4, 0x2A86);
-
-  tft.setCursor(170, 113);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setTextSize(3);
-  tft.println("+");
-  tft.setCursor(178, 232);
-  tft.println("-");
-  tft.setTextSize(1);
+void handlePage6() {
+    if (!readTouch()) return;
+    const uint8_t ints[] = {1, 2, 5, 10, 30, 60};
+    for (uint8_t i = 0; i < 6; i++) {
+        int bx = (i % 3) * 78 + 6, by = 58 + (i / 3) * 50;
+        if (touchX >= bx && touchX <= bx + 72 && touchY >= by && touchY <= by + 42) {
+            timedInterval = ints[i]; drawTimedCountSetup(); return;
+        }
+    }
+    if (touchX >= 40 && touchX <= 200 && touchY >= 175 && touchY <= 215) {
+        startTimedCount(); page = 7; drawTimedCountRunning(); return;
+    }
+    if (touchX >= 40 && touchX <= 200 && touchY >= 228 && touchY <= 260) {
+        page = 0; dashboardBuilt = false; prevDoseLevel = 255;
+        strcpy(lastDoseStr, ""); drawDashboard(); dashboardBuilt = true; return;
+    }
 }
 
-void drawWifiPage()
-{
-  drawFrame();
+// ============================================================================
+// PAGE 7 — TIMED COUNT RUNNING
+// ============================================================================
+void drawTimedCountRunning() {
+    drawFrame("TIMED COUNT");
 
-  drawBackButton();
+    // Static elements — progress bar frame + Live CPM card + button
+    tft.drawRect(15, 50, 210, 18, C_ACCENT);  // progress bar outline (static)
 
-  tft.fillRoundRect(3, 23, 234, 35, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(7, 48);
-  tft.println("LOGGING AND WIFI");
-  tft.drawFastHLine(8, 51, 222, WHITE);
+    tft.fillRoundRect(25, 115, 190, 50, 6, C_CARD_BG);
+    tft.drawRoundRect(25, 115, 190, 50, 6, C_ACCENT);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_CARD_BG);
+    tft.setCursor(25 + (190 - textW("Live CPM", 1)) / 2, 130);
+    tft.print("Live CPM");
 
-  tft.fillRoundRect(3, 64, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 64, 234, 44, 4, WHITE);
-  tft.setCursor(48, 94);
-  tft.println("WIFI SETUP");
-
-  if (isLogging)
-  {
-    tft.fillRoundRect(3, 114, 234, 44, 4, 0x3B8F);
-    tft.drawRoundRect(3, 114, 234, 44, 4, WHITE);
-    tft.setCursor(38, 145);
-    tft.println("LOGGING ON");
-  }
-  else
-  {
-    tft.fillRoundRect(3, 114, 234, 44, 4, 0xB9C7);
-    tft.drawRoundRect(3, 114, 234, 44, 4, WHITE);
-    tft.setCursor(33, 145);
-    tft.println("LOGGING OFF");
-  }
-  
-  tft.fillRoundRect(3, 164, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 164, 234, 44, 4, WHITE);
-  tft.setCursor(31, 194);
-  tft.println("UPLOAD DATA");
-
-  tft.fillRoundRect(3, 214, 234, 44, 4, 0x2A86);
-  tft.drawRoundRect(3, 214, 234, 44, 4, WHITE);
-  tft.setCursor(35, 244);
-  tft.println("DEVICE MODE");
-
-  if (addr > 2000)
-  {
-    tft.setFont(&FreeSans9pt7b);
-    tft.setCursor(80, 297);
-    tft.println("Log memory full"); 
-  }
+    if (!timedComplete) {
+        tft.fillRoundRect(40, 215, 160, 42, 6, C_BTN_OFF);
+        tft.drawRoundRect(40, 215, 160, 42, 6, C_RED);
+        tft.setTextSize(2);
+        tft.setTextColor(C_WHITE, C_BTN_OFF);
+        tft.setCursor(40 + (160 - textW("STOP", 2)) / 2, 226);
+        tft.print("STOP");
+    } else {
+        drawTimedComplete();
+    }
 }
 
-void drawTimedCountPage()
-{
-  drawFrame();
+// Called only when timed count finishes
+void drawTimedComplete() {
+    unsigned long el = (currentMillis - timedStartMillis) / 1000;
+    unsigned long ctsRun = totalPulseCount - timedCountsAtStart;
+    float tCPM = (el > 0) ? (float)ctsRun * 60.0f / (float)el : 0.0f;
 
-  drawBackButton();
+    tft.setTextSize(2);
+    tft.setTextColor(C_GREEN, C_BG);
+    const char* fl = "Final CPM:";
+    char fbuf[20]; sprintf(fbuf, "%s %u", fl, (int)tCPM);
+    tft.setCursor((240 - textW(fbuf, 2)) / 2, 220);
+    tft.print(fbuf);
 
-  tft.fillRoundRect(145, 271, 92, 45, 3, 0x3B8F);
-  tft.drawRoundRect(145, 271, 92, 45, 3, ILI9341_WHITE);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(149, 302);
-  tft.println("BEGIN!");
-
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setCursor(34, 51);
-  tft.println("TIMED COUNT");
-  tft.drawFastHLine(35, 55, 163, WHITE);
-
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(5, 162);
-  tft.println("Duration (minutes):");
-
-  tft.drawRoundRect(160, 70, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(161, 71, 58, 58, 4, 0x2A86);
-  tft.drawRoundRect(160, 185, 60, 60, 4, ILI9341_WHITE);
-  tft.fillRoundRect(161, 186, 58, 58, 4, 0x2A86);
-
-  tft.setCursor(170, 113);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setTextSize(3);
-  tft.println("+");
-  tft.setCursor(178, 232);
-  tft.println("-");
-  tft.setTextSize(1);
-
-  cpm = 0;
-  progress = 0;
-
+    tft.fillRoundRect(40, 252, 160, 36, 5, C_BTN_ON);
+    tft.drawRoundRect(40, 252, 160, 36, 5, C_GREEN);
+    tft.setTextSize(1);
+    tft.setTextColor(C_WHITE, C_BTN_ON);
+    tft.setCursor(40 + (160 - textW("CLOSE", 1)) / 2, 266);
+    tft.print("CLOSE");
+    drawBackButton();
 }
 
-void drawTimedCountRunningPage(int duration, int size)
-{
-  drawFrame();
+// Partial update — only dynamic data (called every second while running)
+void updateTimedCountDisplay() {
+    unsigned long el = (currentMillis - timedStartMillis) / 1000;
+    unsigned long tot = (unsigned long)timedInterval * 60;
+    unsigned long rem = (el < tot) ? (tot - el) : 0;
 
-  drawCancelButton();
+    // Progress bar fill (clear old, draw new)
+    tft.fillRect(16, 51, 208, 16, C_BG);
+    int fw = (int)((float)el / (float)tot * 210.0f);
+    if (fw > 210) fw = 210;
+    if (fw > 0) tft.fillRect(16, 51, fw - 1, 16, timedComplete ? C_GREEN : C_ACCENT2);
 
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setTextSize(1);
-  tft.setCursor(34, 51);
-  tft.println("TIMED COUNT");
-  tft.drawFastHLine(35, 55, 163, WHITE);
+    // Time remaining (centered)
+    tft.fillRect(15, 78, 210, 20, C_BG);
+    tft.setTextSize(2);
+    if (timedComplete) {
+        tft.setTextColor(C_GREEN, C_BG);
+        tft.setCursor((240 - textW("COMPLETE!", 2)) / 2, 95);
+        tft.print("COMPLETE!");
+    } else {
+        tft.setTextColor(C_WHITE, C_BG);
+        char tb[20]; sprintf(tb, "Remain: %lu:%02lu", rem / 60, rem % 60);
+        tft.setCursor((240 - textW(tb, 2)) / 2, 95);
+        tft.print(tb);
+    }
 
-  tft.drawRoundRect(3, 66, 234, 95, 4, ILI9341_WHITE);
-  tft.drawRect(10, 103, 220, 20, ILI9341_WHITE);
-  tft.drawRoundRect(3, 164, 234, 103, 4, ILI9341_WHITE);
+    // Live CPM number (centered in card)
+    unsigned long ctsRun = totalPulseCount - timedCountsAtStart;
+    float tCPM = (el > 0) ? (float)ctsRun * 60.0f / (float)el : 0.0f;
+    tft.fillRect(26, 138, 188, 26, C_CARD_BG);
+    tft.setTextSize(3);
+    tft.setTextColor(C_WHITE, C_CARD_BG);
+    char cb[10]; sprintf(cb, "%lu", (unsigned long)tCPM);
+    tft.setCursor(25 + (190 - textW(cb, 3)) / 2, 140);
+    tft.print(cb);
 
-  tft.setCursor(58, 90);
-  tft.println("Progress:");
-  tft.setCursor(13, 150);
-  tft.println("Duration:");
-  tft.setCursor(115, 150);
-  tft.println(duration);
-  tft.setCursor((135 + (size - 1)*15), 150);
-  tft.println("min");
-  tft.setCursor(15, 200);
-  tft.println("Counts:");
-  tft.setCursor(37, 245);
-  tft.println("CPM:");
-
-  currentCount = 0;
-  startMillis = millis();
-  intervalMillis = duration * 60000;
-  completed = 0;
+    // Counts (centered)
+    tft.fillRect(15, 175, 210, 14, C_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(C_DIM, C_BG);
+    char cntBuf[24]; sprintf(cntBuf, "Counts: %lu", ctsRun);
+    tft.setCursor((240 - textW(cntBuf, 1)) / 2, 186);
+    tft.print(cntBuf);
 }
 
-void drawDeviceModePage()
-{
-  drawFrame();
-
-  tft.fillRoundRect(3, 23, 234, 40, 3, 0x3B8F);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(34, 51);
-  tft.println("DEVICE MODE");
-  tft.drawFastHLine(35, 57, 160, WHITE);
-
-  drawBackButton();
-
-  tft.drawRoundRect(3, 70, 234, 50, 4, WHITE);
-  if (deviceMode == 0)
-  tft.fillRoundRect(4, 71, 232, 48, 4, 0x2A86);
-  tft.setCursor(13, 103);
-  tft.println("GEIGER COUNTER");
-
-  tft.drawRoundRect(3, 127, 234, 50, 4, WHITE);
-  if (deviceMode == 1)
-  tft.fillRoundRect(4, 128, 232, 48, 4, 0x2A86);
-  tft.setCursor(30, 160);
-  tft.println("MON. STATION");
-
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(20, 200);
-  tft.println("Press Back button and");
-  tft.setCursor(20, 220);
-  tft.println("reset device for changes");
-  tft.setCursor(20, 240);
-  tft.println("to take effect");
+void handlePage7() {
+    if (timedRunning && !timedComplete) {
+        unsigned long el = (currentMillis - timedStartMillis) / 1000;
+        unsigned long tot = (unsigned long)timedInterval * 60;
+        if (el != timedElapsed) {
+            timedElapsed = el;
+            if (el >= tot) {
+                timedComplete = true; timedRunning = false;
+                drawTimedComplete();
+            } else {
+                updateTimedCountDisplay();
+            }
+        }
+    }
+    if (!readTouch()) return;
+    if (!timedComplete) {
+        if (touchX >= 40 && touchX <= 200 && touchY >= 215 && touchY <= 257) {
+            stopTimedCount(); drawTimedComplete(); return;
+        }
+    } else {
+        if ((touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) ||
+            (touchX >= 40 && touchX <= 200 && touchY >= 252 && touchY <= 288)) {
+            page = 0; dashboardBuilt = false; prevDoseLevel = 255;
+            strcpy(lastDoseStr, ""); drawDashboard(); dashboardBuilt = true; return;
+        }
+    }
 }
 
-void isr() // interrupt service routine
-{
-  if ((micros() - 200) > previousIntMicros){
-    currentCount++;
-    cumulativeCount++;
-  }
-  previousIntMicros = micros();
+void startTimedCount() {
+    timedRunning = true; timedComplete = false;
+    timedCountsAtStart = totalPulseCount;
+    timedStartMillis = currentMillis; timedElapsed = 0;
 }
 
-void drawBackButton(){
-  tft.fillRoundRect(4, 271, 62, 45, 3, 0x3B8F);
-  tft.drawRoundRect(4, 271, 62, 45, 3, ILI9341_WHITE);
-  tft.drawBitmap(4, 271, backBitmap, 62, 45, ILI9341_WHITE);
+void stopTimedCount() {
+    timedRunning = false; timedComplete = true;
+    timedElapsed = (currentMillis - timedStartMillis) / 1000;
 }
 
-void drawFrame(){
-  tft.fillRect(2, 21, 236, 298, ILI9341_BLACK);
-  tft.drawRect(0, 0, tft.width(), tft.height(), ILI9341_WHITE);
+// ============================================================================
+// PAGE 8 — ABOUT
+// ============================================================================
+void drawAboutPage() {
+    drawFrame("ABOUT GC-20");
+    drawBackButton();
 
-  tft.drawRoundRect(210, 4, 26, 14, 3, ILI9341_WHITE);
-  tft.drawLine(209, 8, 209, 13, ILI9341_WHITE); // Battery symbol
-  tft.drawLine(208, 8, 208, 13, ILI9341_WHITE);
-  tft.fillRect(212, 6, 22, 10, ILI9341_BLACK);
-  tft.fillRect(batteryMapped, 6, (234 - batteryMapped), 10, ILI9341_GREEN);
-  
-  tft.setFont(&FreeSans9pt7b);
-  tft.setCursor(2, 16);
-  tft.setTextColor(ILI9341_CYAN);
-  
-  tft.setTextSize(1);
-  tft.println("GC-20");
-  tft.setTextColor(ILI9341_WHITE);
+    tft.setTextSize(1);
+    int y = 36;
 
-  tft.setFont();
-  tft.setTextSize(2);
-  tft.setCursor(118, 4);
-  tft.println("+");
-  tft.setTextSize(1);
-  tft.setFont(&FreeSans9pt7b);
+    tft.setTextColor(C_ACCENT2, C_BG); tft.setCursor(8, y); y += 16;
+    tft.print("GC-20 Geiger Counter v3.2");
+    tft.setTextColor(C_DIM, C_BG); tft.setCursor(8, y); y += 18;
+    tft.print("Standalone Radiation Monitor");
+    tft.setTextColor(C_WHITE, C_BG); tft.setCursor(8, y); y += 14;
+    tft.print("Tube: SBM-20 Geiger-Muller");
+    tft.setCursor(8, y); y += 14;
+    tft.print("MCU:  ESP8266 @ 160 MHz");
+    tft.setCursor(8, y); y += 14;
+    tft.print("Display: ILI9341 2.8\" 240x320");
+    tft.setCursor(8, y); y += 14;
+    tft.print("Touch:  XPT2046 (TPM408-2.8)");
+    y += 6;
 
-  tft.drawBitmap(103, 2, betaBitmap, 18, 18, ILI9341_WHITE);
-  tft.drawBitmap(128, 2, gammaBitmap, 12, 18, ILI9341_WHITE);
+    tft.setTextColor(C_ACCENT2, C_BG); tft.setCursor(8, y); y += 14;
+    tft.print("Calibration:");
+    tft.setTextColor(C_WHITE, C_BG); tft.setCursor(8, y); y += 14;
+    tft.print("Sensitivity: "); tft.print(tubeSensitivity); tft.print(" CPM/uSv/h");
+    tft.setCursor(8, y); y += 14;
+    tft.print("Dead Time: "); tft.print(deadTime); tft.print(" us");
+    tft.setCursor(8, y); y += 14;
+    tft.print("Background: "); tft.print(backgroundCPM); tft.print(" CPM");
+    y += 6;
 
-  tft.drawLine(1, 20, 238, 20, ILI9341_WHITE);
-  tft.setFont(&FreeSans9pt7b);
-  if (isLogging)
-  {
-    tft.setCursor(175, 16);
-    tft.println("L");
-  }
-  else
-  {
-    tft.fillRect(175, 2, 18, 18, ILI9341_BLACK);
-  }
-  
-  if (deviceMode)
-  {
-    tft.drawBitmap(188, 1, wifiBitmap, 18, 18, ILI9341_WHITE);
-  }
-  else
-  {
-    tft.fillRect(188, 1, 19, 19, ILI9341_BLACK);
-  }
+    tft.setTextColor(C_ACCENT2, C_BG); tft.setCursor(8, y); y += 14;
+    tft.print("Session:");
+    tft.setTextColor(C_WHITE, C_BG); tft.setCursor(8, y); y += 14;
+    tft.print("Pulses: "); tft.print(totalPulseCount);
+    tft.setCursor(8, y); y += 14;
+    char db[12]; formatDose(db, totalDose);
+    tft.print("Dose: "); tft.print(db); tft.print(doseUnits == 0 ? " uSv" : " mR");
+    unsigned long us = currentMillis / 1000;
+    tft.setCursor(8, y); y += 14;
+    tft.print("Uptime: "); tft.print(us / 86400); tft.print("d ");
+    tft.print((us % 86400) / 3600); tft.print("h ");
+    tft.print((us % 3600) / 60); tft.print("m");
+    tft.setTextColor(C_DIM, C_BG); tft.setCursor(8, y + 10);
+    tft.print("License: CC BY-SA 4.0");
 }
 
-void drawCancelButton()
-{
-  tft.fillRoundRect(70, 271, 100, 45, 3, 0xB9C7);
-  tft.drawRoundRect(70, 271, 100, 45, 3, ILI9341_WHITE);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(72, 302);
-  tft.println("CANCEL");
-}
-
-void drawCloseButton()
-{
-  tft.fillRoundRect(70, 271, 100, 45, 3, 0x3B8F);
-  tft.drawRoundRect(70, 271, 100, 45, 3, ILI9341_WHITE);
-  tft.setTextSize(1);
-  tft.setFont(&FreeSans12pt7b);
-  tft.setCursor(79, 302);
-  tft.println("CLOSE");
-}
-
-long EEPROMReadlong(long address) {
-  long four = EEPROM.read(address);
-  long three = EEPROM.read(address + 1);
-  long two = EEPROM.read(address + 2);
-  long one = EEPROM.read(address + 3);
- 
-  return ((four << 0) & 0xFF) + ((three << 8) & 0xFFFF) + ((two << 16) & 0xFFFFFF) + ((one << 24) & 0xFFFFFFFF);
-}
-
-void EEPROMWritelong(int address, long value) {
-  byte four = (value & 0xFF);
-  byte three = ((value >> 8) & 0xFF);
-  byte two = ((value >> 16) & 0xFF);
-  byte one = ((value >> 24) & 0xFF);
- 
-  EEPROM.write(address, four);
-  EEPROM.write(address + 1, three);
-  EEPROM.write(address + 2, two);
-  EEPROM.write(address + 3, one);
-}
-
-void createJsonFile()
-{
-  Serial.println(addr);
-  for (int i = 100; i < addr; i += 4)
-  {
-    int count = EEPROMReadlong(i);
-
-    int deltaT = 600;
-    strcat(jsonBuffer,"{\"delta_t\":");
-    size_t lengthT = String(deltaT).length();
-    char temp[10];
-    String(deltaT).toCharArray(temp,lengthT + 1);
-    strcat(jsonBuffer,temp);
-    strcat(jsonBuffer,",");
-
-    strcat(jsonBuffer, "\"field1\":");
-    lengthT = String(count).length();
-    String(count).toCharArray(temp, lengthT + 1);
-
-    strcat(jsonBuffer,temp);
-    strcat(jsonBuffer,"},");
-
-  }
-  size_t len = strlen(jsonBuffer);
-  jsonBuffer[len-1] = ']';
-
-}
-
-void drawBlankDialogueBox()
-{
-  tft.setFont(&FreeSans9pt7b);
-  tft.setTextSize(1);
-
-  tft.fillRoundRect(20, 50, 200, 220, 6, ILI9341_BLACK);
-  tft.drawRoundRect(20, 50, 200, 220, 6, ILI9341_WHITE);
-
-}
-
-void clearLogs()
-{
-  for (int j = 100; j < 4000; j ++)
-  {
-    EEPROMWritelong(j, 0);
-  }
-  for (int k = 1; k < 1000; k++) // keep the first character in jsonBuffer: "["
-  {
-    jsonBuffer[k] = 0;
-  }
-  addr = 100;
-  EEPROMWritelong(96, addr);
-  EEPROM.write(saveLoggingMode, 0);
-  EEPROM.commit();
-  isLogging = 0;
+void handlePage8() {
+    if (!readTouch()) return;
+    if (touchX >= 3 && touchX <= 61 && touchY >= 284 && touchY <= 316) {
+        page = 1; drawSettingsMenu(); return;
+    }
 }
